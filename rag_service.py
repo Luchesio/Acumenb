@@ -108,13 +108,12 @@ class RAGService:
         parts = []
         if document.get('section_title'):
             parts.append(f"Section: {document['section_title']}")
-        pdf_metadata = document.get('pdf_metadata', {})
-        if pdf_metadata.get('title'):
-            parts.append(f"Document Title: {pdf_metadata['title']}")
-        if pdf_metadata.get('author'):
-            parts.append(f"Author: {pdf_metadata['author']}")
-        if pdf_metadata.get('subject'):
-            parts.append(f"Subject: {pdf_metadata['subject']}")
+        if document.get('pdf_title'):
+            parts.append(f"Document Title: {document['pdf_title']}")
+        if document.get('pdf_author'):
+            parts.append(f"Author: {document['pdf_author']}")
+        if document.get('pdf_subject'):
+            parts.append(f"Subject: {document['pdf_subject']}")
         if document.get('text_content'):
             parts.append(f"Content: {document['text_content']}")
         return "\n".join(parts)
@@ -155,7 +154,9 @@ class RAGService:
                         "filename": doc['filename'],
                         "section_title": doc['section_title'],
                         "original_doc_ref": str(doc['_id']),  # Stringify ObjectId
-                        "pdf_metadata": doc.get('pdf_metadata', {})
+                        "pdf_author": doc.get('pdf_metadata', {}).get('author', ''),
+                        "pdf_title": doc.get('pdf_metadata', {}).get('title', ''),
+                        "pdf_subject": doc.get('pdf_metadata', {}).get('subject', '')
                     }
                 })
             
@@ -203,7 +204,9 @@ class RAGService:
                     "upload_id": meta['upload_id'],
                     "similarity": match.score,  # Cosine similarity
                     "original_doc_ref": meta['original_doc_ref'],
-                    "pdf_metadata": meta.get('pdf_metadata', {})
+                    "pdf_author": meta.get('pdf_author', ''),
+                    "pdf_title": meta.get('pdf_title', ''),
+                    "pdf_subject": meta.get('pdf_subject', '')
                 })
             
             return {"success": True, "results": processed_results, "query": query}
@@ -295,7 +298,9 @@ class RAGService:
                 
                 context_doc = {
                     'section_title': result['section_title'],
-                    'pdf_metadata': result.get('pdf_metadata', {}),
+                    'pdf_author': result.get('pdf_author', ''),
+                    'pdf_title': result.get('pdf_title', ''),
+                    'pdf_subject': result.get('pdf_subject', ''),
                     'text_content': text_content
                 }
                 context_text = self._create_document_text(context_doc)
