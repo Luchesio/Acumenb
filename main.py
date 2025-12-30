@@ -35,12 +35,7 @@ DATABASE_NAME = os.getenv("DATABASE_NAME")
 USERS_COLLECTION = os.getenv("USERS_COLLECTION", "users")
 DOCUMENTS_COLLECTION = os.getenv("DOCUMENTS_COLLECTION", "pdf_documents")
 
-# Documents storage directory
-DOCUMENTS_DIR = "documents"
-os.makedirs(DOCUMENTS_DIR, exist_ok=True)
-
 # Initialize MongoDB client
-# client = MongoClient(MONGO_URI)
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 context.minimum_version = ssl.TLSVersion.TLSv1_2
 
@@ -217,25 +212,10 @@ def process_pdf_to_mongodb(pdf_path: str, user_id: str, filename: str):
         # Generate unique upload ID
         upload_id = secrets.token_urlsafe(16)
         
-        # Prepare CSV path
-        user_dir = os.path.join(DOCUMENTS_DIR, user_id)
-        os.makedirs(user_dir, exist_ok=True)
-        csv_path = os.path.join(user_dir, f"{upload_id}.csv.gz")
-        
-        # Prepare data for CSV
-        csv_data = []
         documents = []
         
         for idx, section in enumerate(sections_data):
             section_number = idx + 1
-            csv_data.append({
-                'section_number': section_number,
-                'section_title': section['section_title'],
-                'start_page': section['start_page'],
-                'end_page': section['end_page'],
-                'text_content': section['text_content'],
-                'section_type': section['section_type']
-            })
             
             document = {
                 "user_id": user_id,
@@ -244,9 +224,9 @@ def process_pdf_to_mongodb(pdf_path: str, user_id: str, filename: str):
                 "section_number": section_number,
                 "section_title": section['section_title'],
                 "section_type": section['section_type'],
+                "text_content": section['text_content'],  # Store directly in MongoDB
                 "start_page": section['start_page'],
                 "end_page": section['end_page'],
-                "csv_path": csv_path,
                 "total_pages": total_pages,
                 "pdf_metadata": {
                     "author": metadata.get("author", ""),
@@ -257,11 +237,7 @@ def process_pdf_to_mongodb(pdf_path: str, user_id: str, filename: str):
             }
             documents.append(document)
         
-        # Write to compressed CSV
-        df = pd.DataFrame(csv_data)
-        df.to_csv(csv_path, index=False, compression='gzip', quoting=csv.QUOTE_ALL)
-        
-        # Insert metadata into MongoDB
+        # Insert into MongoDB
         result = documents_collection.insert_many(documents)
         
         return {
@@ -281,35 +257,8 @@ async def root():
     return {
         "message": "PDF Processing API with RAG Search", 
         "version": "3.0",
-        "features": ["User Authentication", "PDF Processing", "RAG Search with FAISS + Gemini"]
+        "features": ["User Authentication", "PDF Processing", "RAG Search with Pinecone + Gemini"]
     }
-
-
-@app.post("/admin/rebuild-all-indexes")
-async def rebuild_all_indexes():
-    """Admin endpoint to rebuild all user indexes"""
-    try:
-        # Get all unique user_ids
-        pipeline = [
-            {"$group": {"_id": "$user_id"}}
-        ]
-        user_ids = [doc["_id"] for doc in documents_collection.aggregate(pipeline)]
-        
-        results = []
-        for user_id in user_ids:
-            result = rag_service._rebuild_user_index(user_id)
-            results.append({
-                "user_id": user_id,
-                "success": result
-            })
-        
-        return {
-            "success": True,
-            "rebuilt_users": len(results),
-            "details": results
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/register")
 async def register_user(email: str, password: str, name: str):
@@ -357,17 +306,6 @@ async def delete_document(
 ):
     """Delete a document and all its sections"""
     try:
-        # Get csv_path first
-        sample_doc = documents_collection.find_one({
-            "user_id": current_user["user_id"],
-            "upload_id": upload_id
-        })
-        
-        if not sample_doc:
-            raise HTTPException(status_code=404, detail="Document not found")
-        
-        csv_path = sample_doc["csv_path"]
-        
         # Delete from documents collection
         result = documents_collection.delete_many({
             "user_id": current_user["user_id"],
@@ -376,10 +314,6 @@ async def delete_document(
         
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Document not found")
-        
-        # Delete CSV file
-        if os.path.exists(csv_path):
-            os.remove(csv_path)
         
         # Delete vector embeddings
         rag_result = rag_service.delete_document_vectors(
@@ -438,22 +372,14 @@ async def rag_search(
             # Fetch metadata from MongoDB
             doc = documents_collection.find_one(
                 {"_id": result["original_doc_ref"]},
-                {"pdf_metadata": 1, "start_page": 1, "end_page": 1, "csv_path": 1, "section_number": 1}
+                {"pdf_metadata": 1, "start_page": 1, "end_page": 1, "text_content": 1, "section_number": 1}
             )
             
             if doc:
                 result["pdf_metadata"] = doc.get("pdf_metadata", {})
                 result["start_page"] = doc.get("start_page")
                 result["end_page"] = doc.get("end_page")
-                
-                # Load text_content from CSV
-                csv_path = doc["csv_path"]
-                section_number = doc["section_number"]
-                if os.path.exists(csv_path):
-                    df = pd.read_csv(csv_path, compression='infer')
-                    section_row = df[df['section_number'] == section_number]
-                    if not section_row.empty:
-                        result["text_content"] = section_row['text_content'].iloc[0]
+                result["text_content"] = doc.get("text_content", "")
             
             enhanced_results.append(result)
         

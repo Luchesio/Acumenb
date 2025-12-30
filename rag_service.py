@@ -7,7 +7,6 @@ import google.generativeai as genai
 from datetime import datetime
 import hashlib
 import ssl
-import pandas as pd
 import re
 from pinecone import Pinecone, ServerlessSpec
 
@@ -137,26 +136,12 @@ class RAGService:
             index = self._ensure_user_index(user_id)
             
             vectors = []
-            csv_to_df = {}
             
             for doc in documents:
-                csv_path = doc['csv_path']
-                if not os.path.exists(csv_path):
+                if not doc.get('text_content'):  # Skip if no content
                     continue
                 
-                if csv_path not in csv_to_df:
-                    csv_to_df[csv_path] = pd.read_csv(csv_path, compression='infer')
-                
-                df = csv_to_df[csv_path]
-                section_row = df[df['section_number'] == doc['section_number']]
-                if section_row.empty:
-                    continue
-                
-                text_content = section_row['text_content'].iloc[0]
-                section_type = section_row['section_type'].iloc[0]
-                
-                doc_with_text = {**doc, 'text_content': text_content, 'section_type': section_type}
-                searchable_text = self._create_document_text(doc_with_text)
+                searchable_text = self._create_document_text(doc)
                 embedding = self._generate_embedding(searchable_text).tolist()  # Pinecone expects list
                 
                 doc_id = self._generate_document_id(doc)
@@ -170,13 +155,12 @@ class RAGService:
                         "filename": doc['filename'],
                         "section_title": doc['section_title'],
                         "original_doc_ref": str(doc['_id']),  # Stringify ObjectId
-                        "csv_path": csv_path,
                         "pdf_metadata": doc.get('pdf_metadata', {})
                     }
                 })
             
             if vectors:
-                index.upsert(vectors=vectors, namespace="default")  # Use namespace if needed for multi-tenancy
+                index.upsert(vectors=vectors, namespace="")  # Use empty string for default namespace
             
             return {
                 "success": True,
@@ -202,7 +186,7 @@ class RAGService:
                 vector=query_embedding,
                 top_k=top_k,
                 include_metadata=True,
-                namespace="default",
+                namespace="",  # Empty string for default
                 filter=filter
             )
             
@@ -219,7 +203,6 @@ class RAGService:
                     "upload_id": meta['upload_id'],
                     "similarity": match.score,  # Cosine similarity
                     "original_doc_ref": meta['original_doc_ref'],
-                    "csv_path": meta['csv_path'],
                     "pdf_metadata": meta.get('pdf_metadata', {})
                 })
             
@@ -237,13 +220,13 @@ class RAGService:
                 vector=[0] * self.embedding_dimension,  # Dummy vector
                 top_k=10000,  # Adjust based on expected max sections
                 filter={"upload_id": upload_id},
-                namespace="default"
+                namespace=""
             )
             
             ids_to_delete = [match.id for match in results.matches]
             
             if ids_to_delete:
-                index.delete(ids=ids_to_delete, namespace="default")
+                index.delete(ids=ids_to_delete, namespace="")
             
             return {"success": True, "deleted_count": len(ids_to_delete)}
             
@@ -288,7 +271,6 @@ class RAGService:
             return {"success": False, "message": f"Error getting stats: {str(e)}"}
     
     def generate_answer(self, user_id: str, query: str, top_k: int = 5, upload_id: Optional[str] = None) -> Dict[str, Any]:
-        # (This remains mostly unchanged; just update the search call)
         try:
             search_results = self.search(user_id=user_id, query=query, top_k=top_k, upload_id=upload_id)
             
@@ -305,16 +287,11 @@ class RAGService:
             
             context_parts = []
             sources = []
-            csv_to_df = {}
             
             for i, result in enumerate(search_results["results"], 1):
-                csv_path = result['csv_path']
-                if csv_path not in csv_to_df:
-                    csv_to_df[csv_path] = pd.read_csv(csv_path, compression='infer')
-                
-                df = csv_to_df[csv_path]
-                section_row = df[df['section_number'] == result['section_number']]
-                text_content = section_row['text_content'].iloc[0] if not section_row.empty else ""
+                # Fetch text_content from MongoDB
+                doc = self.documents_collection.find_one({"_id": result["original_doc_ref"]})
+                text_content = doc.get('text_content', "") if doc else ""
                 
                 context_doc = {
                     'section_title': result['section_title'],
