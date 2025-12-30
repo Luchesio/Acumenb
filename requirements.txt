@@ -8,4 +8,4 @@ python-multipart
 faiss-cpu
 google-generativeai
 numpy
-pinecone-client
+pinecone
