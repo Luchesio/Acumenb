@@ -59,8 +59,10 @@ class RAGService:
         self.pc = Pinecone(api_key=self.pinecone_api_key)
     
     def _get_user_index_name(self, user_id: str) -> str:
-        """Generate a unique index name for each user"""
-        return f"user-{user_id.replace('-', '')}"  # Pinecone index names can't have dashes in some cases
+        """Generate a unique, valid index name for each user"""
+        # Hash user_id to ensure lowercase alphanum (md5 hex is 0-9a-f)
+        user_hash = hashlib.md5(user_id.encode()).hexdigest()
+        return f"user-{user_hash}"
     
     def _ensure_user_index(self, user_id: str):
         """Create or get the user's Pinecone index"""
