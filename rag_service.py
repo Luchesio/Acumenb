@@ -353,7 +353,7 @@ MY QUESTION: {query}
 Please provide a clear, accurate answer based on the documents above. Reference which documents you're using."""
 
             model = genai.GenerativeModel(
-                model_name='gemini-1.5-flash',
+                model_name='gemini-3-flash-preview',
                 system_instruction=system_prompt
             )
 
