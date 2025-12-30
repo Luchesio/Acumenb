@@ -284,6 +284,33 @@ async def root():
         "features": ["User Authentication", "PDF Processing", "RAG Search with FAISS + Gemini"]
     }
 
+
+@app.post("/admin/rebuild-all-indexes")
+async def rebuild_all_indexes():
+    """Admin endpoint to rebuild all user indexes"""
+    try:
+        # Get all unique user_ids
+        pipeline = [
+            {"$group": {"_id": "$user_id"}}
+        ]
+        user_ids = [doc["_id"] for doc in documents_collection.aggregate(pipeline)]
+        
+        results = []
+        for user_id in user_ids:
+            result = rag_service._rebuild_user_index(user_id)
+            results.append({
+                "user_id": user_id,
+                "success": result
+            })
+        
+        return {
+            "success": True,
+            "rebuilt_users": len(results),
+            "details": results
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/register")
 async def register_user(email: str, password: str, name: str):
     """Register a new user"""

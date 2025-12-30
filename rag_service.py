@@ -33,7 +33,7 @@ class RAGService:
         self.client = MongoClient(
             self.mongo_uri,
             tls=True,
-            tlsAllowInvalidCertificates=True  # This helps with Python 3.13 SSL issues
+            tlsAllowInvalidCertificates=True
         )
 
         self.db = self.client[self.database_name]
@@ -51,10 +51,7 @@ class RAGService:
         genai.configure(api_key=self.gemini_api_key)
         
         # Initialize embedding model
-        # Using text-embedding-004 which is the latest Gemini embedding model
         self.embedding_model_name = "models/text-embedding-004"
-        
-        # Embedding dimension for text-embedding-004 is 768
         self.embedding_dimension = 768
         
         # FAISS indexes per user (in-memory cache)
@@ -68,9 +65,7 @@ class RAGService:
         return os.path.join(self.index_dir, f"{user_id}_metadata.pkl")
     
     def _generate_embedding(self, text: str) -> np.ndarray:
-        """
-        Generate embedding for a given text using Gemini
-        """
+        """Generate embedding for a given text using Gemini"""
         try:
             result = genai.embed_content(
                 model=self.embedding_model_name,
@@ -84,9 +79,7 @@ class RAGService:
             raise
     
     def _generate_query_embedding(self, query: str) -> np.ndarray:
-        """
-        Generate embedding for a query using Gemini
-        """
+        """Generate embedding for a query using Gemini"""
         try:
             result = genai.embed_content(
                 model=self.embedding_model_name,
@@ -100,16 +93,12 @@ class RAGService:
             raise
     
     def _create_document_text(self, document: Dict[str, Any]) -> str:
-        """
-        Create a searchable text representation from document
-        """
+        """Create a searchable text representation from document"""
         parts = []
         
-        # Add section title
         if document.get('section_title'):
             parts.append(f"Section: {document['section_title']}")
         
-        # Add PDF metadata
         pdf_metadata = document.get('pdf_metadata', {})
         if pdf_metadata.get('title'):
             parts.append(f"Document Title: {pdf_metadata['title']}")
@@ -118,30 +107,190 @@ class RAGService:
         if pdf_metadata.get('subject'):
             parts.append(f"Subject: {pdf_metadata['subject']}")
         
-        # Add text content
         if document.get('text_content'):
             parts.append(f"Content: {document['text_content']}")
         
         return "\n".join(parts)
     
     def _generate_document_id(self, document: Dict[str, Any]) -> str:
-        """
-        Generate a unique ID for a document section
-        """
+        """Generate a unique ID for a document section"""
         unique_string = f"{document['user_id']}_{document['upload_id']}_{document['section_number']}"
         return hashlib.md5(unique_string.encode()).hexdigest()
     
     def _generate_id_int(self, doc_id: str) -> int:
-        """
-        Generate int64 ID from string doc_id
-        """
+        """Generate int64 ID from string doc_id"""
         hash_hex = hashlib.sha256(doc_id.encode()).hexdigest()
         return int(hash_hex, 16) & (2**63 - 1)
     
+    def _load_text_from_csv(self, csv_path: str, section_number: int) -> Optional[str]:
+        """Helper method to load text content from CSV file"""
+        try:
+            if not os.path.exists(csv_path):
+                print(f"CSV file not found: {csv_path}")
+                return None
+            
+            df = pd.read_csv(csv_path, compression='infer')
+            section_row = df[df['section_number'] == section_number]
+            
+            if section_row.empty:
+                print(f"Section {section_number} not found in CSV")
+                return None
+            
+            return section_row['text_content'].iloc[0]
+        except Exception as e:
+            print(f"Error loading text from CSV: {str(e)}")
+            return None
+    
+    def _load_user_index(self, user_id: str) -> bool:
+        """
+        Load user index from disk or build from scratch if not exists
+        FIXED VERSION: Better error handling and index rebuilding
+        """
+        index_path = self._get_user_index_path(user_id)
+        metadata_path = self._get_user_metadata_path(user_id)
+        
+        # Try to load from disk first
+        if os.path.exists(index_path) and os.path.exists(metadata_path):
+            try:
+                print(f"Loading index from disk for user: {user_id}")
+                index = faiss.read_index(index_path)
+                with open(metadata_path, 'rb') as f:
+                    metadata = pickle.load(f)
+                
+                # Verify index is not empty
+                if index.ntotal > 0:
+                    self.user_indexes[user_id] = index
+                    self.user_metadata[user_id] = metadata
+                    print(f"Successfully loaded index with {index.ntotal} vectors")
+                    return True
+                else:
+                    print("Loaded index is empty, rebuilding...")
+            except Exception as e:
+                print(f"Error loading user index, rebuilding: {str(e)}")
+        
+        # Build from scratch
+        print(f"Building index from scratch for user: {user_id}")
+        return self._rebuild_user_index(user_id)
+    
+    def _rebuild_user_index(self, user_id: str) -> bool:
+        """
+        Rebuild user index from MongoDB documents
+        FIXED VERSION: Properly loads text from CSV files
+        """
+        try:
+            # Fetch all documents for this user
+            docs = list(self.documents_collection.find({"user_id": user_id}))
+            
+            print(f"Found {len(docs)} documents for user {user_id}")
+            
+            if not docs:
+                # Create empty index
+                self.user_indexes[user_id] = faiss.IndexIDMap(
+                    faiss.IndexFlatL2(self.embedding_dimension)
+                )
+                self.user_metadata[user_id] = {}
+                print("No documents found, created empty index")
+                return False
+            
+            # Create new index
+            index = faiss.IndexIDMap(faiss.IndexFlatL2(self.embedding_dimension))
+            metadata = {}
+            
+            # Track CSV files we've already loaded
+            csv_cache = {}
+            
+            indexed_count = 0
+            for doc in docs:
+                try:
+                    csv_path = doc.get('csv_path')
+                    section_number = doc.get('section_number')
+                    
+                    if not csv_path or not section_number:
+                        print(f"Missing csv_path or section_number for doc {doc.get('_id')}")
+                        continue
+                    
+                    # Load CSV into cache if not already loaded
+                    if csv_path not in csv_cache:
+                        if not os.path.exists(csv_path):
+                            print(f"CSV file not found: {csv_path}")
+                            continue
+                        csv_cache[csv_path] = pd.read_csv(csv_path, compression='infer')
+                    
+                    df = csv_cache[csv_path]
+                    section_row = df[df['section_number'] == section_number]
+                    
+                    if section_row.empty:
+                        print(f"Section {section_number} not found in CSV")
+                        continue
+                    
+                    text_content = section_row['text_content'].iloc[0]
+                    
+                    # Create document with text content
+                    doc_with_text = {**doc, 'text_content': text_content}
+                    searchable_text = self._create_document_text(doc_with_text)
+                    
+                    # Generate embedding
+                    embedding = self._generate_embedding(searchable_text)
+                    
+                    # Generate IDs
+                    doc_id = self._generate_document_id(doc)
+                    id_int = self._generate_id_int(doc_id)
+                    
+                    # Add to index
+                    index.add_with_ids(
+                        embedding.reshape(1, -1),
+                        np.array([id_int], dtype='int64')
+                    )
+                    
+                    # Store metadata
+                    metadata[id_int] = {
+                        'document_id': doc_id,
+                        'upload_id': doc['upload_id'],
+                        'section_number': doc['section_number'],
+                        'filename': doc['filename'],
+                        'section_title': doc['section_title'],
+                        'original_doc_ref': doc['_id'],
+                        'csv_path': csv_path,
+                        'pdf_metadata': doc.get('pdf_metadata', {})
+                    }
+                    
+                    indexed_count += 1
+                    
+                except Exception as e:
+                    print(f"Error processing document {doc.get('_id')}: {str(e)}")
+                    continue
+            
+            print(f"Successfully indexed {indexed_count} documents")
+            
+            if indexed_count > 0:
+                # Save to disk
+                faiss.write_index(index, self._get_user_index_path(user_id))
+                with open(self._get_user_metadata_path(user_id), 'wb') as f:
+                    pickle.dump(metadata, f)
+                
+                # Store in memory
+                self.user_indexes[user_id] = index
+                self.user_metadata[user_id] = metadata
+                return True
+            else:
+                # Create empty index
+                self.user_indexes[user_id] = faiss.IndexIDMap(
+                    faiss.IndexFlatL2(self.embedding_dimension)
+                )
+                self.user_metadata[user_id] = {}
+                return False
+            
+        except Exception as e:
+            print(f"Error rebuilding user index: {str(e)}")
+            # Create empty index on error
+            self.user_indexes[user_id] = faiss.IndexIDMap(
+                faiss.IndexFlatL2(self.embedding_dimension)
+            )
+            self.user_metadata[user_id] = {}
+            return False
+    
     def index_document(self, user_id: str, upload_id: str) -> Dict[str, Any]:
-        """
-        Index all sections of a newly uploaded document
-        """
+        """Index all sections of a newly uploaded document"""
         try:
             # Fetch all sections metadata for this upload
             documents = list(self.documents_collection.find({
@@ -200,7 +349,7 @@ class RAGService:
                     'section_number': doc['section_number'],
                     'filename': doc['filename'],
                     'section_title': doc['section_title'],
-                    'original_doc_ref': doc['_id'],  # Keep as ObjectId
+                    'original_doc_ref': doc['_id'],
                     'csv_path': csv_path,
                     'pdf_metadata': doc.get('pdf_metadata', {})
                 }
@@ -225,87 +374,6 @@ class RAGService:
                 "message": f"Error indexing document: {str(e)}"
             }
     
-    def _load_user_index(self, user_id: str) -> bool:
-        """
-        Load user index from disk or build from scratch if not exists
-        """
-        index_path = self._get_user_index_path(user_id)
-        metadata_path = self._get_user_metadata_path(user_id)
-        
-        if os.path.exists(index_path) and os.path.exists(metadata_path):
-            try:
-                index = faiss.read_index(index_path)
-                with open(metadata_path, 'rb') as f:
-                    metadata = pickle.load(f)
-                
-                self.user_indexes[user_id] = index
-                self.user_metadata[user_id] = metadata
-                return True
-            except Exception as e:
-                print(f"Error loading user index: {str(e)}")
-                # Fall through to rebuild
-        
-        # Build from scratch
-        try:
-            docs = list(self.documents_collection.find({"user_id": user_id}))
-            
-            if not docs:
-                self.user_indexes[user_id] = faiss.IndexIDMap(faiss.IndexFlatL2(self.embedding_dimension))
-                self.user_metadata[user_id] = {}
-                return False
-            
-            index = faiss.IndexIDMap(faiss.IndexFlatL2(self.embedding_dimension))
-            metadata = {}
-            csv_to_df = {}
-            
-            for doc in docs:
-                csv_path = doc.get('csv_path')
-                if not csv_path or not os.path.exists(csv_path):
-                    continue
-                
-                if csv_path not in csv_to_df:
-                    csv_to_df[csv_path] = pd.read_csv(csv_path, compression='infer')
-                
-                df = csv_to_df[csv_path]
-                section_row = df[df['section_number'] == doc['section_number']]
-                if section_row.empty:
-                    continue
-                
-                text_content = section_row['text_content'].iloc[0]
-                section_type = section_row['section_type'].iloc[0]
-                
-                doc_with_text = {**doc, 'text_content': text_content, 'section_type': section_type}
-                searchable_text = self._create_document_text(doc_with_text)
-                embedding = self._generate_embedding(searchable_text)
-                
-                doc_id = self._generate_document_id(doc)
-                id_int = self._generate_id_int(doc_id)
-                
-                index.add_with_ids(embedding.reshape(1, -1), np.array([id_int], dtype='int64'))
-                metadata[id_int] = {
-                    'document_id': doc_id,
-                    'upload_id': doc['upload_id'],
-                    'section_number': doc['section_number'],
-                    'filename': doc['filename'],
-                    'section_title': doc['section_title'],
-                    'original_doc_ref': doc['_id'],
-                    'csv_path': csv_path,
-                    'pdf_metadata': doc.get('pdf_metadata', {})
-                }
-            
-            # Save after build
-            faiss.write_index(index, index_path)
-            with open(metadata_path, 'wb') as f:
-                pickle.dump(metadata, f)
-            
-            self.user_indexes[user_id] = index
-            self.user_metadata[user_id] = metadata
-            return True
-            
-        except Exception as e:
-            print(f"Error building user index from scratch: {str(e)}")
-            return False
-    
     def search(
         self,
         user_id: str,
@@ -315,43 +383,42 @@ class RAGService:
     ) -> Dict[str, Any]:
         """
         Search through user's documents using RAG
-        
-        Args:
-            user_id: User ID to search within
-            query: Search query
-            top_k: Number of top results to return
-            upload_id: Optional - limit search to specific document
-        
-        Returns:
-            Dictionary with search results
+        FIXED VERSION: Forces index rebuild if empty
         """
         try:
-            # Load index
+            # Load index (will rebuild if needed)
             if user_id not in self.user_indexes:
-                if not self._load_user_index(user_id):
+                loaded = self._load_user_index(user_id)
+                if not loaded:
                     return {
                         "success": False,
-                        "message": "No indexed documents found for this user",
+                        "message": "No indexed documents found. Please upload and index documents first.",
                         "results": []
                     }
+            
+            # Get index and verify it's not empty
+            index = self.user_indexes[user_id]
+            metadata_dict = self.user_metadata[user_id]
+            
+            if index.ntotal == 0:
+                # Try to rebuild
+                print(f"Index is empty, attempting rebuild for user {user_id}")
+                rebuilt = self._rebuild_user_index(user_id)
+                if not rebuilt:
+                    return {
+                        "success": False,
+                        "message": "No indexed documents found. Please upload documents first.",
+                        "results": []
+                    }
+                index = self.user_indexes[user_id]
+                metadata_dict = self.user_metadata[user_id]
             
             # Generate query embedding
             query_embedding = self._generate_query_embedding(query)
             query_vector = query_embedding.reshape(1, -1)
             
-            # Get user's index and metadata
-            index = self.user_indexes[user_id]
-            metadata_dict = self.user_metadata[user_id]
-            
-            if index.ntotal == 0:
-                return {
-                    "success": False,
-                    "message": "No indexed documents",
-                    "results": []
-                }
-            
             # Determine search k
-            search_k = index.ntotal if upload_id else top_k
+            search_k = min(index.ntotal, top_k * 3) if upload_id else top_k
             
             # Search
             distances, ids = index.search(query_vector, search_k)
@@ -367,7 +434,7 @@ class RAGService:
                     result = meta.copy()
                     result['score'] = float(distances[0][i])
                     result['similarity'] = 1 / (1 + float(distances[0][i]))
-                    result['original_doc_ref'] = str(result['original_doc_ref'])  # Convert ObjectId to str
+                    result['original_doc_ref'] = str(result['original_doc_ref'])
                     results.append(result)
             
             # Filter by upload_id if specified
@@ -392,9 +459,7 @@ class RAGService:
             }
     
     def delete_document_vectors(self, user_id: str, upload_id: str) -> Dict[str, Any]:
-        """
-        Delete all vectors for a specific document
-        """
+        """Delete all vectors for a specific document"""
         try:
             if user_id not in self.user_indexes:
                 self._load_user_index(user_id)
@@ -430,9 +495,7 @@ class RAGService:
             }
     
     def delete_user_vectors(self, user_id: str) -> Dict[str, Any]:
-        """
-        Delete all vectors for a specific user
-        """
+        """Delete all vectors for a specific user"""
         try:
             index_path = self._get_user_index_path(user_id)
             metadata_path = self._get_user_metadata_path(user_id)
@@ -440,7 +503,7 @@ class RAGService:
             deleted_count = 0
             if os.path.exists(index_path):
                 os.remove(index_path)
-                deleted_count += 1  # Placeholder, actual count not tracked
+                deleted_count += 1
             
             if os.path.exists(metadata_path):
                 os.remove(metadata_path)
@@ -463,9 +526,7 @@ class RAGService:
             }
     
     def get_user_stats(self, user_id: str) -> Dict[str, Any]:
-        """
-        Get statistics about user's indexed documents
-        """
+        """Get statistics about user's indexed documents"""
         try:
             self._load_user_index(user_id)
             total_sections = len(self.user_metadata.get(user_id, {}))
@@ -502,18 +563,7 @@ class RAGService:
         top_k: int = 5,
         upload_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Generate an answer to user's query using RAG with Gemini 2.5 Flash
-        
-        Args:
-            user_id: User ID
-            query: User's question
-            top_k: Number of context documents to retrieve
-            upload_id: Optional - limit search to specific document
-        
-        Returns:
-            Dictionary with answer and sources
-        """
+        """Generate an answer to user's query using RAG with Gemini"""
         try:
             # Step 1: Retrieve relevant documents
             search_results = self.search(
@@ -552,13 +602,6 @@ class RAGService:
                 section_row = df[df['section_number'] == result['section_number']]
                 text_content = section_row['text_content'].iloc[0] if not section_row.empty else ""
                 
-                context_doc = {
-                    'section_title': result['section_title'],
-                    'pdf_metadata': result.get('pdf_metadata', {}),
-                    'text_content': text_content
-                }
-                context_text = self._create_document_text(context_doc)
-                
                 context_parts.append(
                     f"[Document {i}]\n"
                     f"Source: {result['filename']}\n"
@@ -591,12 +634,7 @@ Guidelines:
 - Base your answer ONLY on the provided documents
 - Reference documents inline like: "According to Document 1, ..."
 - If information is missing, just say so
-- Keep it flowing and readable
-
-Example of good formatting:
-"Your documents discuss several key concepts. Document 1 explains how **cognitive bias** affects decision-making, particularly in financial contexts. The author notes that people often create narratives to understand complex situations. Document 2 builds on this by exploring how **identity** forms through repeated behaviors over time."
-
-Stay natural, clear, and conversational."""
+- Keep it flowing and readable"""
 
             user_prompt = f"""Based on the following excerpts from my documents, please answer my question.
 
@@ -607,14 +645,14 @@ MY QUESTION: {query}
 
 Please provide a clear, accurate answer based on the documents above. Reference which documents you're using."""
 
-            # Step 4: Generate response using Gemini 2.5 Flash
+            # Step 4: Generate response using Gemini
             model = genai.GenerativeModel(
-                model_name='gemini-2.5-flash',
+                model_name='gemini-2.0-flash-exp',
                 system_instruction=system_prompt
             )
 
             generation_config = genai.GenerationConfig(
-                temperature=0.7,  # More natural, less robotic
+                temperature=0.7,
                 top_p=0.95,
                 top_k=40,
                 candidate_count=1,
@@ -626,10 +664,9 @@ Please provide a clear, accurate answer based on the documents above. Reference 
             )
             
             answer = response.text
-
-            answer = re.sub(r'^\s*[\*\-]\s+', '', answer, flags=re.MULTILINE)  # Remove bullet points
-            answer = re.sub(r'^\s*\d+\.\s+', '', answer, flags=re.MULTILINE)  # Remove numbered lists
-            answer = re.sub(r'\n\s*\n\s*\n+', '\n\n', answer)  # Clean excessive newlines
+            answer = re.sub(r'^\s*[\*\-]\s+', '', answer, flags=re.MULTILINE)
+            answer = re.sub(r'^\s*\d+\.\s+', '', answer, flags=re.MULTILINE)
+            answer = re.sub(r'\n\s*\n\s*\n+', '\n\n', answer)
             answer = answer.strip()
             
             return {
@@ -652,9 +689,7 @@ Please provide a clear, accurate answer based on the documents above. Reference 
 _rag_service_instance = None
 
 def get_rag_service() -> RAGService:
-    """
-    Get or create RAG service singleton instance
-    """
+    """Get or create RAG service singleton instance"""
     global _rag_service_instance
     if _rag_service_instance is None:
         _rag_service_instance = RAGService()
