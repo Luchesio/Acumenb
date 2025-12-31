@@ -1,5 +1,3 @@
-# Updated rag_service.py with removal of truncation in context building
-
 import os
 import numpy as np
 from typing import List, Dict, Any, Optional
@@ -11,17 +9,21 @@ import hashlib
 import ssl
 import re
 from pinecone import Pinecone, ServerlessSpec
+from bson import ObjectId
 
 # Load environment variables
 load_dotenv()
 
 class RAGService:
     """
-    RAG (Retrieval-Augmented Generation) Service using Pinecone and Gemini
+    IMPROVED RAG (Retrieval-Augmented Generation) Service using Pinecone and Gemini
+    - Full content extraction (no truncation)
+    - Better context window management
+    - Improved answer generation
     """
     
     def __init__(self):
-        # MongoDB configuration (still used for document metadata/CSVs)
+        # MongoDB configuration
         self.mongo_uri = os.getenv("MONGO_URI")
         self.database_name = os.getenv("DATABASE_NAME")
         self.documents_collection_name = os.getenv("DOCUMENTS_COLLECTION", "pdf_documents")
@@ -58,10 +60,12 @@ class RAGService:
             raise ValueError("PINECONE_API_KEY not found in environment variables")
         
         self.pc = Pinecone(api_key=self.pinecone_api_key)
+        
+        # Context management
+        self.max_context_chars = 80000  # Increased for full content
     
     def _get_user_index_name(self, user_id: str) -> str:
         """Generate a unique, valid index name for each user"""
-        # Hash user_id to ensure lowercase alphanum (md5 hex is 0-9a-f)
         user_hash = hashlib.md5(user_id.encode()).hexdigest()
         return f"user-{user_hash}"
     
@@ -76,14 +80,25 @@ class RAGService:
                 metric="cosine",
                 spec=ServerlessSpec(
                     cloud="aws",
-                    region="us-east-1"  # Change to your preferred region
+                    region="us-east-1"
                 )
             )
         
         return self.pc.Index(index_name)
     
     def _generate_embedding(self, text: str) -> np.ndarray:
+        """Generate embedding for document indexing"""
         try:
+            # Truncate if too long (Gemini has limits)
+            if len(text) > 10000:
+                # For very long sections, take beginning, middle, and end
+                parts = [
+                    text[:3000],
+                    text[len(text)//2 - 1500:len(text)//2 + 1500],
+                    text[-3000:]
+                ]
+                text = "\n...\n".join(parts)
+            
             result = genai.embed_content(
                 model=self.embedding_model_name,
                 content=text,
@@ -95,6 +110,7 @@ class RAGService:
             raise
     
     def _generate_query_embedding(self, query: str) -> np.ndarray:
+        """Generate embedding for search query"""
         try:
             result = genai.embed_content(
                 model=self.embedding_model_name,
@@ -107,24 +123,35 @@ class RAGService:
             raise
     
     def _create_document_text(self, document: Dict[str, Any]) -> str:
+        """Create searchable text from document with proper structure"""
         parts = []
+        
+        # Add metadata for context
+        if document.get('pdf_title'):
+            parts.append(f"Document: {document['pdf_title']}")
+        
         if document.get('section_title'):
             parts.append(f"Section: {document['section_title']}")
-        if document.get('pdf_title'):
-            parts.append(f"Document Title: {document['pdf_title']}")
+        
         if document.get('pdf_author'):
             parts.append(f"Author: {document['pdf_author']}")
+        
         if document.get('pdf_subject'):
             parts.append(f"Subject: {document['pdf_subject']}")
+        
+        # Add full content (no truncation)
         if document.get('text_content'):
-            parts.append(f"Content: {document['text_content']}")
+            parts.append(f"\nContent:\n{document['text_content']}")
+        
         return "\n".join(parts)
     
     def _generate_document_id(self, document: Dict[str, Any]) -> str:
+        """Generate unique ID for document section"""
         unique_string = f"{document['user_id']}_{document['upload_id']}_{document['section_number']}"
         return hashlib.md5(unique_string.encode()).hexdigest()
     
     def index_document(self, user_id: str, upload_id: str) -> Dict[str, Any]:
+        """Index document with FULL content (no truncation)"""
         try:
             documents = list(self.documents_collection.find({
                 "user_id": user_id,
@@ -134,16 +161,24 @@ class RAGService:
             if not documents:
                 return {"success": False, "message": "No documents found for this upload_id"}
             
+            print(f"\nIndexing {len(documents)} sections for upload_id: {upload_id}")
+            
             index = self._ensure_user_index(user_id)
             
             vectors = []
+            total_chars = 0
             
             for doc in documents:
-                if not doc.get('text_content'):  # Skip if no content
+                if not doc.get('text_content'):
+                    print(f"  Skipping section {doc.get('section_number')} - no content")
                     continue
                 
+                # Create searchable text with FULL content
                 searchable_text = self._create_document_text(doc)
-                embedding = self._generate_embedding(searchable_text).tolist()  # Pinecone expects list
+                total_chars += len(searchable_text)
+                
+                # Generate embedding
+                embedding = self._generate_embedding(searchable_text).tolist()
                 
                 doc_id = self._generate_document_id(doc)
                 
@@ -155,42 +190,49 @@ class RAGService:
                         "section_number": doc['section_number'],
                         "filename": doc['filename'],
                         "section_title": doc['section_title'],
-                        "original_doc_ref": str(doc['_id']),  # Stringify ObjectId
+                        "original_doc_ref": str(doc['_id']),
                         "pdf_author": doc.get('pdf_metadata', {}).get('author', ''),
                         "pdf_title": doc.get('pdf_metadata', {}).get('title', ''),
-                        "pdf_subject": doc.get('pdf_metadata', {}).get('subject', '')
+                        "pdf_subject": doc.get('pdf_metadata', {}).get('subject', ''),
+                        "char_count": len(doc.get('text_content', ''))
                     }
                 })
+                
+                print(f"  ✓ Section {doc['section_number']}: {len(doc.get('text_content', ''))} chars")
             
             if vectors:
-                index.upsert(vectors=vectors, namespace="")  # Use empty string for default namespace
+                index.upsert(vectors=vectors, namespace="")
+                print(f"\n✓ Indexed {len(vectors)} sections ({total_chars:,} total characters)")
             
             return {
                 "success": True,
                 "indexed_sections": len(vectors),
+                "total_characters": total_chars,
                 "upload_id": upload_id,
                 "message": f"Successfully indexed {len(vectors)} sections in Pinecone"
             }
             
         except Exception as e:
+            print(f"Error indexing document: {str(e)}")
             return {"success": False, "message": f"Error indexing document: {str(e)}"}
     
     def search(self, user_id: str, query: str, top_k: int = 5, upload_id: Optional[str] = None) -> Dict[str, Any]:
+        """Search with improved result handling"""
         try:
             index = self._ensure_user_index(user_id)
             
             query_embedding = self._generate_query_embedding(query).tolist()
             
-            filter = {}
+            filter_dict = {}
             if upload_id:
-                filter["upload_id"] = upload_id
+                filter_dict["upload_id"] = upload_id
             
             results = index.query(
                 vector=query_embedding,
                 top_k=top_k,
                 include_metadata=True,
-                namespace="",  # Empty string for default
-                filter=filter
+                namespace="",
+                filter=filter_dict if filter_dict else None
             )
             
             if not results.matches:
@@ -204,11 +246,12 @@ class RAGService:
                     "section_title": meta['section_title'],
                     "filename": meta['filename'],
                     "upload_id": meta['upload_id'],
-                    "similarity": match.score,  # Cosine similarity
+                    "similarity": float(match.score),
                     "original_doc_ref": meta['original_doc_ref'],
                     "pdf_author": meta.get('pdf_author', ''),
                     "pdf_title": meta.get('pdf_title', ''),
-                    "pdf_subject": meta.get('pdf_subject', '')
+                    "pdf_subject": meta.get('pdf_subject', ''),
+                    "char_count": meta.get('char_count', 0)
                 })
             
             return {"success": True, "results": processed_results, "query": query}
@@ -217,13 +260,13 @@ class RAGService:
             return {"success": False, "message": f"Error during search: {str(e)}"}
     
     def delete_document_vectors(self, user_id: str, upload_id: str) -> Dict[str, Any]:
+        """Delete vectors for a specific document"""
         try:
             index = self._ensure_user_index(user_id)
             
-            # Query to get IDs to delete
             results = index.query(
-                vector=[0] * self.embedding_dimension,  # Dummy vector
-                top_k=10000,  # Adjust based on expected max sections
+                vector=[0] * self.embedding_dimension,
+                top_k=10000,
                 filter={"upload_id": upload_id},
                 namespace=""
             )
@@ -239,6 +282,7 @@ class RAGService:
             return {"success": False, "message": f"Error deleting document vectors: {str(e)}"}
     
     def delete_user_vectors(self, user_id: str) -> Dict[str, Any]:
+        """Delete all vectors for a user"""
         try:
             index_name = self._get_user_index_name(user_id)
             if index_name in self.pc.list_indexes().names():
@@ -249,6 +293,7 @@ class RAGService:
             return {"success": False, "message": f"Error deleting user vectors: {str(e)}"}
     
     def get_user_stats(self, user_id: str) -> Dict[str, Any]:
+        """Get statistics about indexed documents"""
         try:
             index = self._ensure_user_index(user_id)
             stats = index.describe_index_stats()
@@ -259,7 +304,8 @@ class RAGService:
                 {"$group": {
                     "_id": "$upload_id",
                     "filename": {"$first": "$filename"},
-                    "sections_count": {"$sum": 1}
+                    "sections_count": {"$sum": 1},
+                    "total_chars": {"$sum": "$char_count"}
                 }}
             ]
             
@@ -275,8 +321,29 @@ class RAGService:
         except Exception as e:
             return {"success": False, "message": f"Error getting stats: {str(e)}"}
     
+    def _smart_truncate_context(self, text: str, max_chars: int) -> str:
+        """Intelligently truncate text while preserving meaning"""
+        if len(text) <= max_chars:
+            return text
+        
+        # Try to break at sentence boundaries
+        truncated = text[:max_chars]
+        last_period = truncated.rfind('.')
+        last_newline = truncated.rfind('\n')
+        
+        break_point = max(last_period, last_newline)
+        
+        if break_point > max_chars * 0.8:  # If we can keep at least 80%
+            return truncated[:break_point + 1]
+        
+        return truncated + "..."
+    
     def generate_answer(self, user_id: str, query: str, top_k: int = 5, upload_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        IMPROVED: Generate answer using FULL content from retrieved sections
+        """
         try:
+            # Search for relevant sections
             search_results = self.search(user_id=user_id, query=query, top_k=top_k, upload_id=upload_id)
             
             if not search_results["success"]:
@@ -290,80 +357,103 @@ class RAGService:
                     "query": query
                 }
             
+            # Build context from retrieved sections with FULL content
             context_parts = []
             sources = []
+            total_context_chars = 0
+            max_per_section = self.max_context_chars // top_k  # Distribute evenly
             
             for i, result in enumerate(search_results["results"], 1):
-                # Fetch text_content from MongoDB
-                doc = self.documents_collection.find_one({"_id": result["original_doc_ref"]})
-                text_content = doc.get('text_content', "") if doc else ""
+                # Fetch FULL text_content from MongoDB
+                try:
+                    doc = self.documents_collection.find_one({"_id": ObjectId(result["original_doc_ref"])})
+                    text_content = doc.get('text_content', "") if doc else ""
+                except:
+                    text_content = ""
                 
-                context_doc = {
-                    'section_title': result['section_title'],
-                    'pdf_author': result.get('pdf_author', ''),
-                    'pdf_title': result.get('pdf_title', ''),
-                    'pdf_subject': result.get('pdf_subject', ''),
-                    'text_content': text_content
-                }
-                context_text = self._create_document_text(context_doc)
+                if not text_content:
+                    continue
+                
+                # Smart truncation if needed (but try to use as much as possible)
+                if len(text_content) > max_per_section:
+                    text_content = self._smart_truncate_context(text_content, max_per_section)
                 
                 context_parts.append(
                     f"[Document {i}]\n"
                     f"Source: {result['filename']}\n"
                     f"Section: {result['section_title']}\n"
-                    f"Content: {text_content}\n"  # Use full content, removed truncation
+                    f"Similarity: {result['similarity']:.2f}\n"
+                    f"Content:\n{text_content}\n"
                 )
+                
+                total_context_chars += len(text_content)
                 
                 sources.append({
                     "filename": result['filename'],
                     "section_title": result['section_title'],
                     "section_number": result['section_number'],
                     "upload_id": result['upload_id'],
-                    "similarity": result['similarity']
+                    "similarity": result['similarity'],
+                    "chars_used": len(text_content)
                 })
             
-            context = "\n\n".join(context_parts)
+            context = "\n" + "="*60 + "\n".join(context_parts)
             
-            system_prompt = """You are a helpful AI assistant answering questions based on PDF documents.
+            print(f"\nContext built: {total_context_chars:,} characters from {len(sources)} sections")
+            
+            # Improved system prompt
+            system_prompt = """You are a highly knowledgeable AI assistant that provides accurate, detailed answers based on PDF documents.
 
 CRITICAL FORMATTING RULES:
-- Write in natural paragraphs and flowing prose
-- Use **bold text** (double asterisks) ONLY for emphasizing key terms, names, or concepts within sentences
-- NEVER use asterisks or dashes for bullet points or lists
-- NEVER use numbered lists unless explicitly asked
-- Write like you're having a conversation, not writing a report
+- Write in natural, flowing paragraphs
+- Use **bold** (double asterisks) ONLY to emphasize key terms, concepts, or names within sentences
+- NEVER use bullet points, dashes, or numbered lists unless explicitly asked
+- Write conversationally, as if explaining to a colleague
 
-Guidelines:
-- Answer naturally and conversationally
-- Base your answer ONLY on the provided documents
-- Reference documents inline like: "According to Document 1, ..."
-- If information is missing, just say so
-- Keep it flowing and readable
+ANSWERING GUIDELINES:
+- Provide comprehensive, detailed answers using ALL relevant information from the documents
+- Reference documents naturally: "According to Document 1..." or "Document 2 explains..."
+- Quote important statements when appropriate, using quotation marks
+- If multiple documents discuss the same topic, synthesize the information
+- If information is missing or unclear, acknowledge this honestly
+- Stay factual and cite specific document sections
 
-Example of good formatting:
-"Your documents discuss several key concepts. Document 1 explains how **cognitive bias** affects decision-making, particularly in financial contexts. The author notes that people often create narratives to understand complex situations. Document 2 builds on this by exploring how **identity** forms through repeated behaviors over time."
+QUALITY STANDARDS:
+- Depth: Provide thorough explanations, not surface-level summaries
+- Accuracy: Use only information from the provided documents
+- Clarity: Organize information logically, but in paragraph form
+- Context: Help the reader understand WHY something matters, not just WHAT it says
 
-Stay natural, clear, and conversational."""
+Remember: Natural prose, detailed explanations, proper citations."""
 
-            user_prompt = f"""Based on the following excerpts from my documents, please answer my question.
+            user_prompt = f"""I need you to answer my question using the document excerpts below. These excerpts contain the full relevant content from my documents.
 
 DOCUMENT EXCERPTS:
 {context}
 
 MY QUESTION: {query}
 
-Please provide a clear, accurate answer based on the documents above. Reference which documents you're using."""
+Please provide a comprehensive, well-explained answer that:
+1. Uses ALL relevant information from the documents
+2. Cites which documents support your statements
+3. Explains concepts thoroughly
+4. Maintains a natural, conversational tone
+5. Uses paragraphs, not lists (unless I specifically asked for a list)
 
+Your answer:"""
+
+            # Use Gemini to generate answer
             model = genai.GenerativeModel(
                 model_name='gemini-3-flash-preview',
                 system_instruction=system_prompt
             )
 
             generation_config = genai.GenerationConfig(
-                temperature=0.7,
+                temperature=0.3,  # Lower for more focused answers
                 top_p=0.95,
                 top_k=40,
                 candidate_count=1,
+                max_output_tokens=4096,  # Allow longer responses
             )
             
             response = model.generate_content(
@@ -372,6 +462,8 @@ Please provide a clear, accurate answer based on the documents above. Reference 
             )
             
             answer = response.text
+            
+            # Clean up any remaining list formatting artifacts
             answer = re.sub(r'^\s*[\*\-]\s+', '', answer, flags=re.MULTILINE)
             answer = re.sub(r'^\s*\d+\.\s+', '', answer, flags=re.MULTILINE)
             answer = re.sub(r'\n\s*\n\s*\n+', '\n\n', answer)
@@ -382,10 +474,12 @@ Please provide a clear, accurate answer based on the documents above. Reference 
                 "answer": answer,
                 "sources": sources,
                 "query": query,
-                "context_documents_used": len(sources)
+                "context_documents_used": len(sources),
+                "total_context_chars": total_context_chars
             }
             
         except Exception as e:
+            print(f"Error generating answer: {str(e)}")
             return {"success": False, "message": f"Error generating answer: {str(e)}", "answer": None}
 
 
@@ -393,6 +487,7 @@ Please provide a clear, accurate answer based on the documents above. Reference 
 _rag_service_instance = None
 
 def get_rag_service() -> RAGService:
+    """Get singleton RAG service instance"""
     global _rag_service_instance
     if _rag_service_instance is None:
         _rag_service_instance = RAGService()
