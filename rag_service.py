@@ -1,3 +1,5 @@
+# Updated rag_service.py with removal of truncation in context building
+
 import os
 import numpy as np
 from typing import List, Dict, Any, Optional
@@ -309,7 +311,7 @@ class RAGService:
                     f"[Document {i}]\n"
                     f"Source: {result['filename']}\n"
                     f"Section: {result['section_title']}\n"
-                    f"Content: {text_content[:1500]}...\n"
+                    f"Content: {text_content}\n"  # Use full content, removed truncation
                 )
                 
                 sources.append({

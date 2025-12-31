@@ -9,3 +9,4 @@ faiss-cpu
 google-generativeai
 numpy
 pinecone
+pdfplumber

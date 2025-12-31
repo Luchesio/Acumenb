@@ -1,3 +1,8 @@
+# Updated main.py with improvements:
+# - Integrated pdfplumber for better text extraction
+# - Enhanced section detection patterns
+# - Improved fallback chunking to paragraph-based
+
 import fitz  # PyMuPDF
 import pandas as pd
 import re
@@ -14,6 +19,7 @@ import hashlib
 import ssl
 from rag_service import get_rag_service
 import csv
+import pdfplumber  # New import for better extraction
 
 # Load environment variables
 load_dotenv()
@@ -82,7 +88,7 @@ def clean_text(text: str) -> str:
     text = re.sub(r' +', ' ', text)
     return text.strip()
 
-def extract_sections_advanced(doc):
+def extract_sections_advanced(doc, pdf_path: str):  # Added pdf_path param for pdfplumber
     """
     Advanced section detection for any PDF type.
     Handles documents with or without clear chapter structure.
@@ -90,19 +96,29 @@ def extract_sections_advanced(doc):
     full_text = ""
     page_texts = []
     
-    # Extract text from each page
-    for page_num, page in enumerate(doc):
-        page_text = page.get_text()
-        page_texts.append({
-            'page_number': page_num + 1,
-            'text': page_text
-        })
-        full_text += page_text + "\n"
+    # Use pdfplumber for better extraction
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            page_text = page.extract_text(layout=True) or ""
+            if not page_text.strip():  # Fallback to table extraction if no text
+                tables = page.extract_tables()
+                if tables:
+                    page_text = "\n".join([" | ".join(row) for table in tables for row in table])
+            
+            page_texts.append({
+                'page_number': page_num + 1,
+                'text': page_text
+            })
+            full_text += page_text + "\n"
     
-    # Try multiple patterns for section detection
+    # Enhanced patterns
     patterns = [
-        r'^(?:Chapter|CHAPTER)\s+(\d+|[IVXLCDM]+)[:\.\s]+(.+?)$',  # Chapter 1: Title
+        r'^(?:Chapter|CHAPTER|Ch\.|Section|SECTION|Sec\.|Part|PART)\s+(\d+|[IVXLCDM]+)[:\.\s-]*(.+?)$',  # More variations
         r'^(?:Section|SECTION)\s+(\d+|[IVXLCDM]+)[:\.\s]+(.+?)$',  # Section 1: Title
+        r'^\s*(\d+\.\d+|\d+)(?:\.\s*|\s+)([A-Z0-9][^\n]{5,100})$',  # Numbered sections with sublevels
+        r'^([A-Z][A-Z0-9\s&-]{5,100})$',  # ALL CAPS or bold-like headings (len >5 to avoid noise)
+        r'^\s*([IVXLCDM]+)\.\s+(.+?)$',  # Roman numerals
+        r'^(?:Article|ARTICLE)\s+(\d+|[IVXLCDM]+)[:\.\s]+(.+?)$',  # Article patterns
         r'^(\d+)\.\s+([A-Z][^\n]{10,100})$',  # 1. Title Format
         r'^([A-Z][A-Z\s]{3,50})$',  # ALL CAPS HEADINGS
         r'^(\d+\.\d+)\s+(.+?)$',  # 1.1 Subsection
@@ -160,34 +176,37 @@ def extract_sections_advanced(doc):
                 'section_type': 'full_document'
             })
         else:
-            # Split into page-based chunks (every 3-5 pages)
-            chunk_size = 3
-            for i in range(0, len(page_texts), chunk_size):
-                chunk_pages = page_texts[i:i + chunk_size]
-                start_page = chunk_pages[0]['page_number']
-                end_page = chunk_pages[-1]['page_number']
-                
-                chunk_text = "\n".join([p['text'] for p in chunk_pages])
-                
-                # Try to find a heading in the first part of the chunk
-                first_lines = chunk_text.split('\n')[:5]
-                chunk_title = None
-                
-                for line in first_lines:
-                    line = line.strip()
-                    if len(line) > 10 and len(line) < 100:
-                        chunk_title = line
-                        break
-                
-                if not chunk_title:
-                    chunk_title = f"Pages {start_page}-{end_page}"
-                
+            # Improved fallback: Split into paragraph-based chunks
+            paragraphs = re.split(r'\n\s*\n', full_text.strip())  # Split on double newlines
+            current_page = 1
+            chunk_text = ""
+            for para in paragraphs:
+                if len(chunk_text) + len(para) > 2000:  # ~500 words per chunk
+                    # Find a title-like line or use pages
+                    first_line = para.split('\n')[0].strip()
+                    chunk_title = first_line if len(first_line) > 10 else f"Chunk starting page {current_page}"
+                    
+                    sections_data.append({
+                        'section_title': chunk_title,
+                        'start_page': current_page,
+                        'end_page': current_page,  # Approximate; improve if needed
+                        'text_content': clean_text(chunk_text),
+                        'section_type': 'paragraph_chunk'
+                    })
+                    chunk_text = para
+                    current_page += 1  # Rough estimate
+                else:
+                    chunk_text += "\n\n" + para
+            
+            # Add last chunk
+            if chunk_text:
+                chunk_title = chunk_text.split('\n')[0].strip() or f"Final Chunk"
                 sections_data.append({
                     'section_title': chunk_title,
-                    'start_page': start_page,
-                    'end_page': end_page,
+                    'start_page': current_page,
+                    'end_page': len(doc),
                     'text_content': clean_text(chunk_text),
-                    'section_type': 'page_chunk'
+                    'section_type': 'paragraph_chunk'
                 })
     
     return sections_data
@@ -197,8 +216,8 @@ def process_pdf_to_mongodb(pdf_path: str, user_id: str, filename: str):
     try:
         doc = fitz.open(pdf_path)
         
-        # Extract sections using advanced detection
-        sections_data = extract_sections_advanced(doc)
+        # Extract sections using advanced detection (pass pdf_path for pdfplumber)
+        sections_data = extract_sections_advanced(doc, pdf_path)
         
         # Get PDF metadata
         metadata = doc.metadata
