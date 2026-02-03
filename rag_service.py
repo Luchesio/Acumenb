@@ -449,9 +449,9 @@ Your answer:"""
             )
 
             generation_config = genai.GenerationConfig(
-                temperature=0.3,  # Lower for more focused answers
-                top_p=0.95,
-                top_k=40,
+                temperature=0.1,  # Lower for more focused answers
+                top_p=0.1,
+                top_k=5,
                 candidate_count=1,
                 max_output_tokens=4096,  # Allow longer responses
             )
