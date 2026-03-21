@@ -620,23 +620,28 @@ async def ask_question(
     upload_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
 ):
-    """Ask a question and get an AI-generated answer based on your documents using RAG"""
+    """Ask a question and get an AI-generated answer based on your documents using RAG."""
     try:
-        if not query or len(query.strip()) < 3:
-            raise HTTPException(status_code=400, detail="Question must be at least 3 characters")
-        
+        # FIX: lowered minimum from 3 chars → 1 char so greetings like "hi"
+        # are accepted and handled by the conversational-intent layer in RAGService.
+        if not query or len(query.strip()) < 1:
+            raise HTTPException(status_code=400, detail="Please enter a message.")
+ 
         result = rag_service.generate_answer(
             user_id=current_user["user_id"],
             query=query,
             top_k=top_k,
             upload_id=upload_id
         )
-        
+ 
         if not result["success"]:
-            raise HTTPException(status_code=500, detail=result.get("message", "Failed to generate answer"))
-        
+            raise HTTPException(
+                status_code=500,
+                detail=result.get("message", "Failed to generate answer")
+            )
+ 
         return result
-        
+ 
     except HTTPException as he:
         raise he
     except Exception as e:
