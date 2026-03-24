@@ -10,3 +10,6 @@ google-generativeai
 numpy
 pinecone
 pdfplumber
+bcrypt
+python-jose[cryptography]
+email-validator
