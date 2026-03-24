@@ -67,7 +67,7 @@ rag_service = get_rag_service()
 users_collection.create_index("email", unique=True)
 users_collection.create_index("user_id", unique=True)
 documents_collection.create_index("user_id")
-documents_collection.create_index([(("user_id", 1), ("upload_id", 1))])
+documents_collection.create_index([("user_id", 1), ("upload_id", 1)])
 
 
 # ─── Pydantic Request Models ────────────────────────────────────────────────
