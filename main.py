@@ -1,4 +1,5 @@
 import fitz  # PyMuPDF
+import pandas as pd
 import re
 import os
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends
@@ -6,22 +7,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional
 import tempfile
 import secrets
 import hashlib
 import ssl
 from rag_service import get_rag_service
+import csv
 import bcrypt
 from jose import JWTError, jwt
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, EmailStr, field_validator
 
 # Load environment variables
 load_dotenv()
 
 # ─── Chunking Configuration ──────────────────────────────────────────────────
+# Fix 3: Replace fixed 6-page window with character-based chunking
+# Fix 4: Enforce a minimum chunk size so near-empty chunks are discarded
 CHUNK_SIZE    = 4000   # target characters per chunk in fallback mode
-CHUNK_OVERLAP = 400    # overlap between consecutive chunks
+CHUNK_OVERLAP = 400    # overlap between consecutive chunks (preserves boundary context)
 MIN_CHUNK_SIZE = 200   # chunks smaller than this are discarded
 
 
@@ -32,7 +36,17 @@ def split_text_with_overlap(
     min_chunk_size: int = MIN_CHUNK_SIZE,
 ) -> list[str]:
     """
-    Split text into overlapping chunks that respect natural language boundaries.
+    Split *text* into overlapping chunks that respect natural language boundaries.
+
+    Priority for break-points (highest → lowest):
+      1. Paragraph break  (\\n\\n)
+      2. Sentence end     ('. ')
+      3. Line break       (\\n)
+      4. Word boundary    (' ')
+      5. Hard cut         (arbitrary character position)
+
+    The *chunk_overlap* region is preserved at the start of each new chunk so
+    that context spanning a boundary is not lost during retrieval.
     """
     if not text or len(text.strip()) < min_chunk_size:
         return []
@@ -54,22 +68,26 @@ def split_text_with_overlap(
                 chunks.append(chunk)
             break
 
+        # Search for the best break-point within the window
         break_point = -1
         for sep in ['\n\n', '. ', '\n', ' ']:
             bp = text.rfind(sep, start, end)
             if bp != -1 and bp > start:
-                break_point = bp + len(sep)
+                break_point = bp + len(sep)   # include separator in the left chunk
                 break
 
         if break_point == -1:
-            break_point = end
+            break_point = end   # hard cut — no natural boundary found
 
         chunk = text[start:break_point].strip()
         if len(chunk) >= min_chunk_size:
             chunks.append(chunk)
 
+        # Slide forward, stepping back by overlap to capture boundary context
         start = max(start + 1, break_point - chunk_overlap)
 
+        # Snap the new start to the nearest natural boundary within the overlap
+        # window so we don't begin mid-sentence when possible.
         snap_end = min(start + chunk_overlap // 2, len(text))
         for sep in ['\n\n', '\n', '. ']:
             bp = text.find(sep, start, snap_end)
@@ -78,7 +96,6 @@ def split_text_with_overlap(
                 break
 
     return chunks
-
 
 app = FastAPI()
 
@@ -95,19 +112,19 @@ app.add_middleware(
 MONGO_URI = os.getenv("MONGO_URI")
 DATABASE_NAME = os.getenv("DATABASE_NAME")
 USERS_COLLECTION = os.getenv("USERS_COLLECTION", "users")
-
-# CHANGED: pdf_uploads stores only lightweight metadata — NO text_content.
-# The full text lives exclusively in Pinecone vector metadata.
-PDF_UPLOADS_COLLECTION = os.getenv("PDF_UPLOADS_COLLECTION", "pdf_uploads")
+DOCUMENTS_COLLECTION = os.getenv("DOCUMENTS_COLLECTION", "pdf_documents")
 
 # JWT configuration
+# IMPORTANT: Set JWT_SECRET_KEY in your .env file — never expose this value.
+# Generate a strong key: python -c "import secrets; print(secrets.token_urlsafe(64))"
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 if not JWT_SECRET_KEY:
+    # Fallback for development — in production this MUST be set in .env
     JWT_SECRET_KEY = secrets.token_urlsafe(64)
     print("WARNING: JWT_SECRET_KEY not set in environment. Using ephemeral key — all tokens will be invalidated on restart.")
 
 JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_DAYS = 30
+ACCESS_TOKEN_EXPIRE_DAYS = 30  # Token valid for 30 days
 
 # Initialize MongoDB client
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -117,19 +134,19 @@ client = MongoClient(MONGO_URI, tls=True, tlsAllowInvalidCertificates=True)
 
 db = client[DATABASE_NAME]
 users_collection = db[USERS_COLLECTION]
-pdf_uploads_collection = db[PDF_UPLOADS_COLLECTION]   # lightweight metadata only
+documents_collection = db[DOCUMENTS_COLLECTION]
 
 # Initialize RAG Service
 rag_service = get_rag_service()
 
-# Create indexes
+# Create indexes for better performance
 users_collection.create_index("email", unique=True)
 users_collection.create_index("user_id", unique=True)
-pdf_uploads_collection.create_index("user_id")
-pdf_uploads_collection.create_index([("user_id", 1), ("upload_id", 1)], unique=True)
+documents_collection.create_index("user_id")
+documents_collection.create_index([("user_id", 1), ("upload_id", 1)])
 
 
-# ─── Pydantic Request Models ─────────────────────────────────────────────────
+# ─── Pydantic Request Models ────────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
     name: str
@@ -140,6 +157,7 @@ class RegisterRequest(BaseModel):
     @classmethod
     def email_must_be_valid(cls, v: str) -> str:
         v = v.strip().lower()
+        # Basic RFC-5322 inspired check — covers the common cases
         pattern = r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
         if not re.match(pattern, v):
             raise ValueError("Invalid email address")
@@ -173,17 +191,27 @@ class LoginRequest(BaseModel):
         return v.strip().lower()
 
 
-# ─── Password Helpers ─────────────────────────────────────────────────────────
+# ─── Password Helpers ───────────────────────────────────────────────────────
 
 def hash_password(password: str) -> str:
+    """Hash a password with bcrypt (includes a random salt automatically)."""
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(plain_password: str, stored_hash: str, user_email: str) -> bool:
+    """
+    Verify a password against a stored hash.
+
+    Migration shim: if the stored hash is an old plain SHA-256 hex digest
+    (64 hex chars, no $ prefix) we verify with the old algorithm and
+    transparently re-hash to bcrypt so the account is secure going forward.
+    """
+    # Detect legacy SHA-256 hash (64 lowercase hex chars, no bcrypt $ prefix)
     if len(stored_hash) == 64 and re.fullmatch(r"[0-9a-f]{64}", stored_hash):
         old_hash = hashlib.sha256(plain_password.encode()).hexdigest()
         if old_hash != stored_hash:
             return False
+        # Valid — migrate to bcrypt silently
         new_hash = hash_password(plain_password)
         users_collection.update_one(
             {"email": user_email},
@@ -191,15 +219,17 @@ def verify_password(plain_password: str, stored_hash: str, user_email: str) -> b
         )
         return True
 
+    # Standard bcrypt path
     try:
         return bcrypt.checkpw(plain_password.encode("utf-8"), stored_hash.encode("utf-8"))
     except Exception:
         return False
 
 
-# ─── JWT Helpers ──────────────────────────────────────────────────────────────
+# ─── JWT Helpers ─────────────────────────────────────────────────────────────
 
 def create_access_token(user_id: str, email: str) -> str:
+    """Create a signed JWT that expires in ACCESS_TOKEN_EXPIRE_DAYS days."""
     expire = datetime.utcnow() + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
     payload = {
         "sub": user_id,
@@ -213,6 +243,13 @@ def create_access_token(user_id: str, email: str) -> str:
 async def get_current_user(
     user_token: Optional[str] = Header(None, alias="X-User-Token")
 ):
+    """
+    Dependency: decode the JWT from the X-User-Token header,
+    then load and return the full user document from MongoDB.
+
+    The X-User-Token header is kept for backward compatibility with the
+    rest of the API (upload, search, delete, etc.) — no changes needed there.
+    """
     if not user_token:
         raise HTTPException(status_code=401, detail="Authentication required. Please log in.")
 
@@ -222,6 +259,7 @@ async def get_current_user(
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token payload.")
     except JWTError as exc:
+        # Distinguish expired vs. malformed for a better UX message
         error_detail = "Your session has expired. Please log in again."
         if "Signature" in str(exc) or "invalid" in str(exc).lower():
             error_detail = "Invalid token. Please log in again."
@@ -234,7 +272,7 @@ async def get_current_user(
     return user
 
 
-# ─── PDF Processing ───────────────────────────────────────────────────────────
+# ─── PDF Processing (unchanged) ──────────────────────────────────────────────
 
 def clean_text(text: str) -> str:
     if not text:
@@ -274,8 +312,7 @@ def extract_text_from_page(page) -> str:
     return clean_text(text)
 
 
-def extract_sections_advanced(doc) -> List[Dict[str, Any]]:
-    """Extract and chunk PDF text into sections. Returns list of section dicts."""
+def extract_sections_advanced(doc):
     full_text = ""
     page_texts = []
 
@@ -319,6 +356,9 @@ def extract_sections_advanced(doc) -> List[Dict[str, Any]]:
     chars_per_page = len(full_text) / len(doc) if len(doc) > 0 else 1000
 
     if detected_sections and len(detected_sections) >= 2:
+        # ── Fix 1 & 4: Structure-based path ─────────────────────────────────
+        # Sub-chunk any section that is too large to embed faithfully, and
+        # discard any section whose content falls below MIN_CHUNK_SIZE.
         for i, match in enumerate(detected_sections):
             section_title = match.group(0).strip()
             start_pos = match.start()
@@ -329,6 +369,7 @@ def extract_sections_advanced(doc) -> List[Dict[str, Any]]:
             )
             section_text = full_text[start_pos:end_pos].strip()
 
+            # Fix 4: skip near-empty sections
             if len(section_text) < MIN_CHUNK_SIZE:
                 print(f"  Skipping tiny section '{section_title}' ({len(section_text)} chars)")
                 continue
@@ -338,6 +379,7 @@ def extract_sections_advanced(doc) -> List[Dict[str, Any]]:
             pages_in_section = max(1, int(len(section_text) / chars_per_page))
             end_page = min(len(doc), start_page + pages_in_section)
 
+            # Fix 1: sub-chunk large sections so no single embedding is lossy
             if len(section_text) > CHUNK_SIZE:
                 sub_chunks = split_text_with_overlap(section_text)
                 for sub_idx, sub_text in enumerate(sub_chunks, start=1):
@@ -364,9 +406,13 @@ def extract_sections_advanced(doc) -> List[Dict[str, Any]]:
                     'char_count': len(section_text)
                 })
     else:
+        # ── Fix 2, 3 & 4: Fallback path ─────────────────────────────────────
+        # Replace the fixed 6-page window with character-based chunking that
+        # uses sentence/paragraph-aware overlap so boundary context is never lost.
         print("No clear sections detected. Using overlap-aware character chunking...")
 
         if len(doc) <= 5:
+            # Tiny document: one chunk is fine, but still enforce minimum size
             if len(full_text) >= MIN_CHUNK_SIZE:
                 sections_data.append({
                     'section_title': 'Complete Document',
@@ -377,15 +423,18 @@ def extract_sections_advanced(doc) -> List[Dict[str, Any]]:
                     'char_count': len(full_text)
                 })
         else:
+            # Fix 3: character-based overlap chunking instead of 6-page windows
             text_chunks = split_text_with_overlap(full_text)
             cumulative = 0
             for chunk_text in text_chunks:
+                # Estimate page range from character position
                 start_page = max(1, int(cumulative / chars_per_page) + 1)
                 end_page = min(
                     len(doc),
                     int((cumulative + len(chunk_text)) / chars_per_page) + 1
                 )
 
+                # Infer a title from the first meaningful line
                 chunk_title = None
                 for line in chunk_text.split('\n')[:10]:
                     line = line.strip()
@@ -395,6 +444,7 @@ def extract_sections_advanced(doc) -> List[Dict[str, Any]]:
                 if not chunk_title:
                     chunk_title = f"Pages {start_page}–{end_page}"
 
+                # Fix 4: skip if still below minimum (edge-case guard)
                 if len(chunk_text) < MIN_CHUNK_SIZE:
                     print(f"  Skipping tiny fallback chunk ({len(chunk_text)} chars)")
                     cumulative += len(chunk_text)
@@ -409,6 +459,7 @@ def extract_sections_advanced(doc) -> List[Dict[str, Any]]:
                     'char_count': len(chunk_text)
                 })
 
+                # Advance past the non-overlapping portion
                 cumulative += max(1, len(chunk_text) - CHUNK_OVERLAP)
 
     total_extracted = sum(s['char_count'] for s in sections_data)
@@ -421,88 +472,83 @@ def extract_sections_advanced(doc) -> List[Dict[str, Any]]:
     return sections_data
 
 
-def process_pdf(pdf_path: str, user_id: str, filename: str):
-    """
-    CHANGED: Extract sections from PDF and return them in-memory.
-    Nothing is stored in MongoDB here. The caller is responsible for:
-      1. Saving lightweight metadata to pdf_uploads_collection
-      2. Passing sections to rag_service.index_document()
+def process_pdf_to_mongodb(pdf_path: str, user_id: str, filename: str):
+    try:
+        doc = fitz.open(pdf_path)
+        print(f"\n{'='*60}")
+        print(f"Processing PDF: {filename}")
+        print(f"Total pages: {len(doc)}")
+        print(f"{'='*60}\n")
 
-    Returns:
-        (sections, metadata_doc)
-        sections      - list of section dicts (with text_content) for Pinecone indexing
-        metadata_doc  - lightweight dict (no text_content) to store in MongoDB
-    """
-    doc = fitz.open(pdf_path)
-    print(f"\n{'='*60}")
-    print(f"Processing PDF: {filename}")
-    print(f"Total pages: {len(doc)}")
-    print(f"{'='*60}\n")
+        sections_data = extract_sections_advanced(doc)
+        metadata = doc.metadata
+        total_pages = len(doc)
+        doc.close()
 
-    sections_data = extract_sections_advanced(doc)
-    pdf_metadata = doc.metadata
-    total_pages = len(doc)
-    doc.close()
+        if not sections_data:
+            raise Exception("No content extracted from PDF")
 
-    if not sections_data:
-        raise Exception("No content extracted from PDF")
+        upload_id = secrets.token_urlsafe(16)
+        documents = []
 
-    upload_id = secrets.token_urlsafe(16)
+        for idx, section in enumerate(sections_data):
+            documents.append({
+                "user_id": user_id,
+                "upload_id": upload_id,
+                "filename": filename,
+                "section_number": idx + 1,
+                "section_title": section['section_title'],
+                "section_type": section['section_type'],
+                "text_content": section['text_content'],
+                "char_count": section['char_count'],
+                "start_page": section['start_page'],
+                "end_page": section['end_page'],
+                "total_pages": total_pages,
+                "pdf_metadata": {
+                    "author": metadata.get("author", ""),
+                    "title": metadata.get("title", ""),
+                    "subject": metadata.get("subject", ""),
+                },
+                "uploaded_at": datetime.utcnow()
+            })
 
-    # Enrich sections with shared fields needed by rag_service.index_document()
-    sections: List[Dict[str, Any]] = []
-    for idx, section in enumerate(sections_data):
-        sections.append({
-            "section_number": idx + 1,
-            "section_title": section['section_title'],
-            "section_type": section['section_type'],
-            "text_content": section['text_content'],      # used by Pinecone only
-            "char_count": section['char_count'],
-            "start_page": section['start_page'],
-            "end_page": section['end_page'],
-            "filename": filename,
-            "pdf_metadata": {
-                "author": pdf_metadata.get("author", ""),
-                "title":  pdf_metadata.get("title", ""),
-                "subject": pdf_metadata.get("subject", ""),
-            },
-        })
+        result = documents_collection.insert_many(documents)
+        print(f"\n{'='*60}")
+        print(f"Successfully saved {len(result.inserted_ids)} sections to MongoDB")
+        print(f"{'='*60}\n")
 
-    # Lightweight metadata record — no text_content stored in MongoDB
-    metadata_doc = {
-        "user_id": user_id,
-        "upload_id": upload_id,
-        "filename": filename,
-        "total_pages": total_pages,
-        "total_sections": len(sections),
-        "total_characters": sum(s['char_count'] for s in sections),
-        "pdf_metadata": {
-            "author": pdf_metadata.get("author", ""),
-            "title":  pdf_metadata.get("title", ""),
-            "subject": pdf_metadata.get("subject", ""),
-        },
-        "uploaded_at": datetime.utcnow(),
-    }
-
-    return sections, metadata_doc
+        return {
+            "success": True,
+            "upload_id": upload_id,
+            "sections_inserted": len(result.inserted_ids),
+            "total_pages": total_pages,
+            "total_characters": sum(s['char_count'] for s in sections_data),
+            "message": "PDF processed and saved to database successfully"
+        }
+    except Exception as e:
+        print(f"Error processing PDF: {str(e)}")
+        raise Exception(f"Error processing PDF: {str(e)}")
 
 
-# ─── Auth Endpoints ───────────────────────────────────────────────────────────
+# ─── Auth Endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
     return {
         "message": "PDF Processing API with RAG Search",
-        "version": "5.0-PINECONE-ONLY",
-        "features": [
-            "JWT Auth", "bcrypt passwords", "User Authentication",
-            "PDF Processing", "RAG Search", "Pinecone-only text storage"
-        ]
+        "version": "4.0-SECURE",
+        "features": ["JWT Auth", "bcrypt passwords", "User Authentication", "PDF Processing", "RAG Search"]
     }
 
 
 @app.post("/register")
 async def register_user(request: RegisterRequest):
+    """
+    Register a new user.
+
+    Accepts a JSON body: { "name": "...", "email": "...", "password": "..." }
+    Returns a JWT access token on success.
+    """
     try:
         existing_user = users_collection.find_one({"email": request.email})
         if existing_user:
@@ -540,12 +586,20 @@ async def register_user(request: RegisterRequest):
 
 @app.post("/login")
 async def login_user(request: LoginRequest):
+    """
+    Log in an existing user.
+
+    Accepts a JSON body: { "email": "...", "password": "..." }
+    Returns a JWT access token on success.
+    """
     try:
         user = users_collection.find_one({"email": request.email})
 
+        # Use a constant-time-safe check so we don't leak whether the email exists
         if not user or not verify_password(request.password, user["password_hash"], request.email):
             raise HTTPException(status_code=401, detail="Invalid email or password.")
 
+        # Issue a fresh token on every login
         access_token = create_access_token(user_id=user["user_id"], email=user["email"])
 
         users_collection.update_one(
@@ -568,19 +622,13 @@ async def login_user(request: LoginRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─── Protected Endpoints ──────────────────────────────────────────────────────
+# ─── Protected Endpoints (unchanged logic, now secured via JWT) ──────────────
 
 @app.post("/upload-pdf")
 async def upload_pdf(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    CHANGED:
-    1. process_pdf() extracts text in-memory (no MongoDB write for text)
-    2. Lightweight metadata saved to pdf_uploads_collection
-    3. Sections passed directly to rag_service.index_document() → Pinecone
-    """
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
     try:
@@ -589,31 +637,14 @@ async def upload_pdf(
             tmp_file.write(content)
             tmp_file_path = tmp_file.name
 
-        # Step 1: Extract sections in-memory
-        sections, metadata_doc = process_pdf(
-            tmp_file_path, current_user["user_id"], file.filename
-        )
+        result = process_pdf_to_mongodb(tmp_file_path, current_user["user_id"], file.filename)
         os.unlink(tmp_file_path)
 
-        # Step 2: Save lightweight metadata to MongoDB (no text_content)
-        pdf_uploads_collection.insert_one(metadata_doc)
+        if result["success"]:
+            index_result = rag_service.index_document(current_user["user_id"], result["upload_id"])
+            result["rag_indexing"] = index_result
 
-        # Step 3: Index sections (with text_content) directly into Pinecone
-        index_result = rag_service.index_document(
-            user_id=current_user["user_id"],
-            upload_id=metadata_doc["upload_id"],
-            sections=sections,
-        )
-
-        return {
-            "success": True,
-            "upload_id": metadata_doc["upload_id"],
-            "sections_indexed": metadata_doc["total_sections"],
-            "total_pages": metadata_doc["total_pages"],
-            "total_characters": metadata_doc["total_characters"],
-            "message": "PDF processed and indexed successfully",
-            "rag_indexing": index_result,
-        }
+        return result
 
     except Exception as e:
         if 'tmp_file_path' in locals() and os.path.exists(tmp_file_path):
@@ -623,22 +654,26 @@ async def upload_pdf(
 
 @app.get("/my-documents")
 async def get_my_documents(current_user: dict = Depends(get_current_user)):
-    """
-    CHANGED: reads from pdf_uploads_collection (lightweight metadata only).
-    No text_content is returned — it lives in Pinecone.
-    """
     try:
-        docs = list(
-            pdf_uploads_collection.find(
-                {"user_id": current_user["user_id"]},
-                {"_id": 0}              # exclude Mongo _id from response
-            ).sort("uploaded_at", -1)
-        )
+        pipeline = [
+            {"$match": {"user_id": current_user["user_id"]}},
+            {"$group": {
+                "_id": "$upload_id",
+                "filename": {"$first": "$filename"},
+                "uploaded_at": {"$first": "$uploaded_at"},
+                "total_sections": {"$sum": 1},
+                "total_pages": {"$first": "$total_pages"},
+                "total_characters": {"$sum": "$char_count"},
+                "pdf_title": {"$first": "$pdf_metadata.title"}
+            }},
+            {"$sort": {"uploaded_at": -1}}
+        ]
+        documents = list(documents_collection.aggregate(pipeline))
         return {
             "success": True,
             "user_id": current_user["user_id"],
-            "total_uploads": len(docs),
-            "documents": docs
+            "total_uploads": len(documents),
+            "documents": documents
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -646,22 +681,19 @@ async def get_my_documents(current_user: dict = Depends(get_current_user)):
 
 @app.get("/document/{upload_id}")
 async def get_document_details(upload_id: str, current_user: dict = Depends(get_current_user)):
-    """
-    CHANGED: returns lightweight metadata from pdf_uploads_collection.
-    Section text is not stored in MongoDB — use /rag-search to query content.
-    """
     try:
-        doc = pdf_uploads_collection.find_one(
-            {"user_id": current_user["user_id"], "upload_id": upload_id},
-            {"_id": 0}
-        )
-        if not doc:
+        sections = list(documents_collection.find(
+            {"user_id": current_user["user_id"], "upload_id": upload_id}
+        ).sort("section_number", 1))
+        if not sections:
             raise HTTPException(status_code=404, detail="Document not found")
-
         return {
             "success": True,
-            **doc,
-            "note": "Section text is stored in Pinecone. Use /rag-search or /ask to query content."
+            "upload_id": upload_id,
+            "filename": sections[0]["filename"],
+            "total_sections": len(sections),
+            "total_characters": sum(s.get("char_count", 0) for s in sections),
+            "sections": sections
         }
     except HTTPException:
         raise
@@ -671,21 +703,16 @@ async def get_document_details(upload_id: str, current_user: dict = Depends(get_
 
 @app.delete("/document/{upload_id}")
 async def delete_document(upload_id: str, current_user: dict = Depends(get_current_user)):
-    """
-    CHANGED: deletes from pdf_uploads_collection + Pinecone vectors.
-    """
     try:
-        result = pdf_uploads_collection.delete_one(
+        result = documents_collection.delete_many(
             {"user_id": current_user["user_id"], "upload_id": upload_id}
         )
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Document not found")
-
         rag_result = rag_service.delete_document_vectors(current_user["user_id"], upload_id)
-
         return {
             "success": True,
-            "upload_id": upload_id,
+            "deleted_sections": result.deleted_count,
             "rag_deletion": rag_result,
             "message": "Document deleted successfully"
         }
@@ -702,22 +729,28 @@ async def rag_search(
     upload_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    CHANGED: text_content now comes directly from Pinecone search results.
-    No secondary MongoDB lookup needed.
-    """
     try:
         if not query or len(query.strip()) < 3:
             raise HTTPException(status_code=400, detail="Query must be at least 3 characters")
-
         results = rag_service.search(
-            user_id=current_user["user_id"],
-            query=query,
-            top_k=top_k,
-            upload_id=upload_id
+            user_id=current_user["user_id"], query=query, top_k=top_k, upload_id=upload_id
         )
+        if not results["success"]:
+            return results
+        enhanced_results = []
+        for result in results["results"]:
+            doc = documents_collection.find_one(
+                {"_id": result["original_doc_ref"]},
+                {"pdf_metadata": 1, "start_page": 1, "end_page": 1, "text_content": 1, "section_number": 1}
+            )
+            if doc:
+                result["pdf_metadata"] = doc.get("pdf_metadata", {})
+                result["start_page"] = doc.get("start_page")
+                result["end_page"] = doc.get("end_page")
+                result["text_content"] = doc.get("text_content", "")
+            enhanced_results.append(result)
+        results["results"] = enhanced_results
         return results
-
     except HTTPException:
         raise
     except Exception as e:
@@ -734,17 +767,12 @@ async def ask_question(
     try:
         if not query or len(query.strip()) < 1:
             raise HTTPException(status_code=400, detail="Please enter a message.")
-
         result = rag_service.generate_answer(
-            user_id=current_user["user_id"],
-            query=query,
-            top_k=top_k,
-            upload_id=upload_id
+            user_id=current_user["user_id"], query=query, top_k=top_k, upload_id=upload_id
         )
         if not result["success"]:
             raise HTTPException(status_code=500, detail=result.get("message", "Failed to generate answer"))
         return result
-
     except HTTPException:
         raise
     except Exception as e:
@@ -753,48 +781,53 @@ async def ask_question(
 
 @app.get("/rag-stats")
 async def get_rag_stats(current_user: dict = Depends(get_current_user)):
-    """
-    Returns Pinecone index stats + document list from lightweight MongoDB metadata.
-    """
     try:
-        pinecone_stats = rag_service.get_user_stats(current_user["user_id"])
-
-        docs = list(
-            pdf_uploads_collection.find(
-                {"user_id": current_user["user_id"]},
-                {"_id": 0}
-            ).sort("uploaded_at", -1)
-        )
-
-        return {
-            **pinecone_stats,
-            "total_documents": len(docs),
-            "documents": docs,
-        }
+        return rag_service.get_user_stats(current_user["user_id"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/reset-my-index")
-async def reset_my_index(current_user: dict = Depends(get_current_user)):
-    """
-    Wipes ALL Pinecone vectors AND all pdf_uploads metadata for this user.
-    Use this once to clear stale vectors before re-uploading your PDFs.
-    """
+@app.post("/reindex-document/{upload_id}")
+async def reindex_document(upload_id: str, current_user: dict = Depends(get_current_user)):
     try:
-        # Delete entire Pinecone index for this user
-        pinecone_result = rag_service.delete_user_vectors(current_user["user_id"])
-
-        # Clear all upload metadata from MongoDB
-        mongo_result = pdf_uploads_collection.delete_many(
-            {"user_id": current_user["user_id"]}
+        doc_exists = documents_collection.find_one(
+            {"user_id": current_user["user_id"], "upload_id": upload_id}
         )
+        if not doc_exists:
+            raise HTTPException(status_code=404, detail="Document not found")
+        return rag_service.index_document(current_user["user_id"], upload_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/reindex-all")
+async def reindex_all_documents(current_user: dict = Depends(get_current_user)):
+    try:
+        pipeline = [
+            {"$match": {"user_id": current_user["user_id"]}},
+            {"$group": {"_id": "$upload_id"}}
+        ]
+        upload_ids = [doc["_id"] for doc in documents_collection.aggregate(pipeline)]
+        if not upload_ids:
+            return {"success": True, "message": "No documents to index", "indexed_documents": 0}
+
+        indexed_count = 0
+        errors = []
+        for uid in upload_ids:
+            result = rag_service.index_document(current_user["user_id"], uid)
+            if result["success"]:
+                indexed_count += 1
+            else:
+                errors.append({"upload_id": uid, "error": result.get("message", "Unknown error")})
 
         return {
             "success": True,
-            "message": "All vectors and document metadata cleared. You can now re-upload your PDFs.",
-            "pinecone": pinecone_result,
-            "metadata_records_deleted": mongo_result.deleted_count,
+            "total_documents": len(upload_ids),
+            "indexed_documents": indexed_count,
+            "failed_documents": len(errors),
+            "errors": errors if errors else None
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

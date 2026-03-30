@@ -1,12 +1,15 @@
 import os
 import numpy as np
 from typing import List, Dict, Any, Optional
+from pymongo import MongoClient
 from dotenv import load_dotenv
 import google.generativeai as genai
 from datetime import datetime
 import hashlib
+import ssl
 import re
 from pinecone import Pinecone, ServerlessSpec
+from bson import ObjectId
 
 # Load environment variables
 load_dotenv()
@@ -17,10 +20,27 @@ class RAGService:
     - Embedding model: gemini-embedding-001 (dim=3072)
     - Conversational queries are answered directly without RAG
     - Document queries use full RAG pipeline
-    - Text content is stored directly in Pinecone vector metadata (no MongoDB)
     """
 
     def __init__(self):
+        # MongoDB configuration
+        self.mongo_uri = os.getenv("MONGO_URI")
+        self.database_name = os.getenv("DATABASE_NAME")
+        self.documents_collection_name = os.getenv("DOCUMENTS_COLLECTION", "pdf_documents")
+
+        # Initialize MongoDB
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+
+        self.client = MongoClient(
+            self.mongo_uri,
+            tls=True,
+            tlsAllowInvalidCertificates=True
+        )
+
+        self.db = self.client[self.database_name]
+        self.documents_collection = self.db[self.documents_collection_name]
+
         # Configure Gemini
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
         if not self.gemini_api_key:
@@ -28,8 +48,15 @@ class RAGService:
 
         genai.configure(api_key=self.gemini_api_key)
 
+        # ── FIX 1: Updated embedding model ──────────────────────────────────
+        # gemini-embedding-001 produces 3072-dimensional vectors.
+        # NOTE: Any existing Pinecone indexes built with text-embedding-004
+        # (768-dim) are incompatible. They will be recreated automatically
+        # the first time _ensure_user_index() is called for each user.
+        # Users must re-index their documents after this change.
         self.embedding_model_name = "models/gemini-embedding-001"
         self.embedding_dimension = 3072
+        # ────────────────────────────────────────────────────────────────────
 
         # Pinecone configuration
         self.pinecone_api_key = os.getenv("PINECONE_API_KEY")
@@ -41,12 +68,16 @@ class RAGService:
         # Context management
         self.max_context_chars = 80000
 
-        # Chunking configuration
+        # ── Chunking configuration (Fix 1, 2) ───────────────────────────────
+        # Sections larger than this are split into overlapping sub-chunks at
+        # index time so every vector represents a focused, complete passage
+        # rather than a lossy sampled digest of a very large block of text.
         self.index_chunk_size    = 1500   # characters per Pinecone vector
         self.index_chunk_overlap = 200    # overlap to preserve boundary context
         self.min_chunk_size      = 150    # sub-chunks smaller than this are skipped
+        # ────────────────────────────────────────────────────────────────────
 
-        # Conversational intent keywords
+        # ── FIX 2: Conversational intent keywords ────────────────────────────
         self._greeting_tokens = {
             'hi', 'hello', 'hey', 'howdy', 'hiya', 'yo', 'sup', 'greetings',
             'good morning', 'good afternoon', 'good evening', 'good night',
@@ -59,13 +90,20 @@ class RAGService:
             'understood', 'alright', 'sure', 'bye', 'goodbye', 'see you',
             'cheers', 'much appreciated',
         }
+        # ────────────────────────────────────────────────────────────────────
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
     def _split_into_chunks(self, text: str) -> List[str]:
         """
-        Split text into overlapping character-based chunks that respect
-        natural language boundaries (paragraph → sentence → line → word).
+        Fix 1 & 2: Split *text* into overlapping character-based chunks that
+        respect natural language boundaries (paragraph → sentence → line → word).
+
+        This replaces the old lossy truncation that sampled only the start,
+        middle, and end of large sections, discarding everything in between.
+        Each chunk is small enough to be embedded faithfully and overlaps its
+        neighbours by *self.index_chunk_overlap* characters so that passages
+        spanning a chunk boundary are still retrievable.
         """
         text = text.strip()
         if not text or len(text) < self.min_chunk_size:
@@ -86,6 +124,7 @@ class RAGService:
                     chunks.append(chunk)
                 break
 
+            # Find the best natural break-point within the window
             break_point = -1
             for sep in ['\n\n', '. ', '\n', ' ']:
                 bp = text.rfind(sep, start, end)
@@ -94,14 +133,16 @@ class RAGService:
                     break
 
             if break_point == -1:
-                break_point = end
+                break_point = end  # hard cut — no natural boundary found
 
             chunk = text[start:break_point].strip()
             if len(chunk) >= self.min_chunk_size:
                 chunks.append(chunk)
 
+            # Slide forward while preserving overlap context
             start = max(start + 1, break_point - self.index_chunk_overlap)
 
+            # Snap start to the nearest natural boundary inside the overlap window
             snap_end = min(start + self.index_chunk_overlap // 2, len(text))
             for sep in ['\n\n', '\n', '. ']:
                 bp = text.find(sep, start, snap_end)
@@ -118,10 +159,17 @@ class RAGService:
     def _ensure_user_index(self, user_id: str):
         """Create or retrieve the user's Pinecone index (3072-dim)."""
         index_name = self._get_user_index_name(user_id)
+
         existing = self.pc.list_indexes().names()
 
         if index_name in existing:
+            # Check whether the existing index has the right dimension.
+            # If it was created with the old model (768) we delete and recreate.
             try:
+                idx = self.pc.Index(index_name)
+                stats = idx.describe_index_stats()
+                # Pinecone doesn't expose dimension in stats directly,
+                # but we can probe via the index description.
                 desc = self.pc.describe_index(index_name)
                 if desc.dimension != self.embedding_dimension:
                     print(
@@ -130,7 +178,7 @@ class RAGService:
                         "Deleting and recreating …"
                     )
                     self.pc.delete_index(index_name)
-                    existing = []
+                    existing = []  # force recreation below
             except Exception as e:
                 print(f"Warning during index dimension check: {e}")
 
@@ -145,7 +193,13 @@ class RAGService:
         return self.pc.Index(index_name)
 
     def _generate_embedding(self, text: str) -> np.ndarray:
-        """Generate an embedding for a single text chunk (gemini-embedding-001)."""
+        """
+        Generate an embedding for a single text chunk (gemini-embedding-001).
+
+        Callers are responsible for splitting large texts into sub-chunks
+        via _split_into_chunks() *before* calling this method.  The old
+        lossy three-region sampling has been removed (Fix 1).
+        """
         try:
             result = genai.embed_content(
                 model=self.embedding_model_name,
@@ -170,25 +224,25 @@ class RAGService:
             print(f"Error generating query embedding: {str(e)}")
             raise
 
-    def _create_searchable_text(self, section: Dict[str, Any]) -> str:
-        """Build the enriched text used for embedding (title + metadata header + content)."""
+    def _create_document_text(self, document: Dict[str, Any]) -> str:
         parts = []
-        meta = section.get('pdf_metadata', {})
-        if meta.get('title'):
-            parts.append(f"Document: {meta['title']}")
-        if section.get('section_title'):
-            parts.append(f"Section: {section['section_title']}")
-        if meta.get('author'):
-            parts.append(f"Author: {meta['author']}")
-        if meta.get('subject'):
-            parts.append(f"Subject: {meta['subject']}")
-        if section.get('text_content'):
-            parts.append(f"\nContent:\n{section['text_content']}")
+        if document.get('pdf_title'):
+            parts.append(f"Document: {document['pdf_title']}")
+        if document.get('section_title'):
+            parts.append(f"Section: {document['section_title']}")
+        if document.get('pdf_author'):
+            parts.append(f"Author: {document['pdf_author']}")
+        if document.get('pdf_subject'):
+            parts.append(f"Subject: {document['pdf_subject']}")
+        if document.get('text_content'):
+            parts.append(f"\nContent:\n{document['text_content']}")
         return "\n".join(parts)
 
-    def _generate_section_id(self, user_id: str, upload_id: str, section_number: int) -> str:
-        """Generate a stable, unique ID for a section (used as deduplication key)."""
-        unique_string = f"{user_id}_{upload_id}_{section_number}"
+    def _generate_document_id(self, document: Dict[str, Any]) -> str:
+        unique_string = (
+            f"{document['user_id']}_{document['upload_id']}_"
+            f"{document['section_number']}"
+        )
         return hashlib.md5(unique_string.encode()).hexdigest()
 
     def _smart_truncate_context(self, text: str, max_chars: int) -> str:
@@ -202,18 +256,25 @@ class RAGService:
             return truncated[:break_point + 1]
         return truncated + "..."
 
-    # ── Conversational intent detection ─────────────────────────────────────
+    # ── FIX 2: Conversational-intent detection ───────────────────────────────
 
     def _is_conversational(self, query: str) -> bool:
+        """
+        Return True when the query is a greeting, social pleasantry, or
+        a short polite phrase that doesn't need document retrieval.
+        """
         q = query.strip().lower().rstrip('!.,?')
 
+        # Exact match against known phrases
         if q in self._greeting_tokens or q in self._polite_closers:
             return True
 
+        # Starts-with match for multi-word greetings
         for phrase in self._greeting_tokens:
             if q.startswith(phrase):
                 return True
 
+        # Very short messages (≤ 4 words) with no question mark are likely conversational
         words = q.split()
         if len(words) <= 4 and '?' not in query:
             filler = {'i', 'am', 'is', 'are', 'a', 'the', 'just', 'so', 'very'}
@@ -224,6 +285,10 @@ class RAGService:
         return False
 
     def _generate_conversational_response(self, query: str) -> Dict[str, Any]:
+        """
+        Produce a friendly, direct response for conversational queries
+        using Gemini without any document context.
+        """
         try:
             system_prompt = (
                 "You are Acumen, a friendly and professional AI assistant "
@@ -268,6 +333,10 @@ class RAGService:
             }
 
     def _generate_general_response(self, query: str) -> Dict[str, Any]:
+        """
+        Answer a non-conversational query that has no relevant document matches.
+        Gemini answers from its own knowledge and gracefully notes the context.
+        """
         try:
             system_prompt = (
                 "You are Acumen, an intelligent AI assistant on a document Q&A "
@@ -316,29 +385,26 @@ class RAGService:
                 "response_type": "general_knowledge"
             }
 
-    # ── Core RAG methods ─────────────────────────────────────────────────────
+    # ── core RAG methods ─────────────────────────────────────────────────────
 
-    def index_document(
-        self,
-        user_id: str,
-        upload_id: str,
-        sections: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
+    def index_document(self, user_id: str, upload_id: str) -> Dict[str, Any]:
         """
-        Index document sections directly into Pinecone.
+        Index document sections into Pinecone.
 
-        CHANGED: sections are passed in directly (no MongoDB read).
-        Each section dict must have: section_number, section_title, filename,
-        text_content, and optionally pdf_metadata (dict with author/title/subject).
-
-        Text content is stored in Pinecone vector metadata so it can be
-        retrieved at query time without any secondary database lookup.
+        Fix 1 & 2: Each section is split into overlapping sub-chunks.
+        One Pinecone vector is created per sub-chunk, so large sections are
+        represented faithfully rather than by a single lossy embedding.
         """
         try:
-            if not sections:
-                return {"success": False, "message": "No sections provided to index"}
+            documents = list(self.documents_collection.find({
+                "user_id": user_id,
+                "upload_id": upload_id
+            }).sort("section_number", 1))
 
-            print(f"\nIndexing {len(sections)} sections for upload_id: {upload_id}")
+            if not documents:
+                return {"success": False, "message": "No documents found for this upload_id"}
+
+            print(f"\nIndexing {len(documents)} sections for upload_id: {upload_id}")
 
             index = self._ensure_user_index(user_id)
 
@@ -346,46 +412,44 @@ class RAGService:
             total_chars = 0
             total_chunks = 0
 
-            for section in sections:
-                if not section.get('text_content'):
-                    print(f"  Skipping section {section.get('section_number')} - no content")
+            for doc in documents:
+                if not doc.get('text_content'):
+                    print(f"  Skipping section {doc.get('section_number')} - no content")
                     continue
 
-                # Build enriched text for embedding (includes title + metadata header)
-                searchable_text = self._create_searchable_text(section)
+                # Build the enriched text the same way as before (title + metadata header)
+                searchable_text = self._create_document_text(doc)
 
-                # Split into overlapping sub-chunks
+                # Fix 1: split into sub-chunks instead of one lossy embedding
                 sub_chunks = self._split_into_chunks(searchable_text)
                 if not sub_chunks:
-                    print(f"  Skipping section {section.get('section_number')} - below min chunk size")
+                    print(f"  Skipping section {doc.get('section_number')} - below min chunk size")
                     continue
 
-                section_id = self._generate_section_id(
-                    user_id, upload_id, section['section_number']
-                )
-                section_chars = len(section.get('text_content', ''))
+                base_doc_id = self._generate_document_id(doc)
+                section_chars = len(doc.get('text_content', ''))
                 total_chars += section_chars
-                meta = section.get('pdf_metadata', {})
 
                 for chunk_idx, chunk_text in enumerate(sub_chunks):
                     embedding = self._generate_embedding(chunk_text).tolist()
 
-                    vector_id = f"{section_id}_c{chunk_idx}"
+                    # Unique vector ID per sub-chunk: base_id + chunk index
+                    vector_id = f"{base_doc_id}_c{chunk_idx}"
 
                     vectors.append({
                         "id": vector_id,
                         "values": embedding,
                         "metadata": {
                             "upload_id": upload_id,
-                            "section_number": section['section_number'],
-                            "filename": section['filename'],
-                            "section_title": section['section_title'],
-                            "section_id": section_id,          # for deduplication
-                            "text_content": chunk_text,         # stored here — no MongoDB needed
-                            "pdf_author": meta.get('author', ''),
-                            "pdf_title": meta.get('title', ''),
-                            "pdf_subject": meta.get('subject', ''),
+                            "section_number": doc['section_number'],
+                            "filename": doc['filename'],
+                            "section_title": doc['section_title'],
+                            "original_doc_ref": str(doc['_id']),
+                            "pdf_author": doc.get('pdf_metadata', {}).get('author', ''),
+                            "pdf_title": doc.get('pdf_metadata', {}).get('title', ''),
+                            "pdf_subject": doc.get('pdf_metadata', {}).get('subject', ''),
                             "char_count": section_chars,
+                            # Store which sub-chunk this vector represents
                             "chunk_index": chunk_idx,
                             "total_chunks": len(sub_chunks),
                         }
@@ -393,28 +457,29 @@ class RAGService:
                     total_chunks += 1
 
                 print(
-                    f"  ✓ Section {section['section_number']}: "
+                    f"  ✓ Section {doc['section_number']}: "
                     f"{section_chars} chars → {len(sub_chunks)} sub-chunk(s)"
                 )
 
             if vectors:
+                # Upsert in batches of 100 to stay within Pinecone limits
                 batch_size = 100
                 for i in range(0, len(vectors), batch_size):
                     index.upsert(vectors=vectors[i:i + batch_size], namespace="")
 
                 print(
-                    f"\n✓ Indexed {len(sections)} sections as {total_chunks} "
+                    f"\n✓ Indexed {len(documents)} sections as {total_chunks} "
                     f"sub-chunks ({total_chars:,} total characters)"
                 )
 
             return {
                 "success": True,
-                "indexed_sections": len(sections),
+                "indexed_sections": len(documents),
                 "indexed_chunks": total_chunks,
                 "total_characters": total_chars,
                 "upload_id": upload_id,
                 "message": (
-                    f"Successfully indexed {len(sections)} sections "
+                    f"Successfully indexed {len(documents)} sections "
                     f"as {total_chunks} sub-chunks in Pinecone"
                 )
             }
@@ -433,8 +498,11 @@ class RAGService:
         """
         Semantic search through a user's Pinecone index.
 
-        CHANGED: deduplication now uses section_id (instead of original_doc_ref).
-        Results include text_content from Pinecone metadata directly.
+        Fix 2: Because each section is now represented by multiple sub-chunk
+        vectors, raw Pinecone results can contain several hits from the same
+        section.  We deduplicate by *original_doc_ref*, keeping only the
+        highest-scoring chunk per section, then return up to *top_k* unique
+        sections so the caller always sees diverse, non-repetitive results.
         """
         try:
             index = self._ensure_user_index(user_id)
@@ -445,6 +513,8 @@ class RAGService:
             if upload_id:
                 filter_dict["upload_id"] = upload_id
 
+            # Request more candidates than top_k so deduplication still leaves
+            # enough unique sections after merging sub-chunk hits.
             raw_top_k = top_k * 4
 
             results = index.query(
@@ -458,13 +528,14 @@ class RAGService:
             if not results.matches:
                 return {"success": False, "message": "No indexed documents available"}
 
-            # Deduplicate: keep best-scoring chunk per section
-            seen: Dict[str, Any] = {}   # section_id → best match so far
+            # ── Deduplication: keep best-scoring chunk per section ───────────
+            seen: Dict[str, Any] = {}   # original_doc_ref → best match so far
             for match in results.matches:
-                sid = match.metadata.get('section_id', match.id)
-                if sid not in seen or match.score > seen[sid].score:
-                    seen[sid] = match
+                ref = match.metadata.get('original_doc_ref', match.id)
+                if ref not in seen or match.score > seen[ref].score:
+                    seen[ref] = match
 
+            # Re-sort by score descending and take top_k unique sections
             deduped = sorted(seen.values(), key=lambda m: m.score, reverse=True)[:top_k]
 
             processed_results = []
@@ -476,12 +547,12 @@ class RAGService:
                     "filename": meta['filename'],
                     "upload_id": meta['upload_id'],
                     "similarity": float(match.score),
-                    "section_id": meta.get('section_id', ''),
-                    "text_content": meta.get('text_content', ''),   # available directly from Pinecone
+                    "original_doc_ref": meta['original_doc_ref'],
                     "pdf_author": meta.get('pdf_author', ''),
                     "pdf_title": meta.get('pdf_title', ''),
                     "pdf_subject": meta.get('pdf_subject', ''),
                     "char_count": meta.get('char_count', 0),
+                    # Expose sub-chunk info for debugging / transparency
                     "chunk_index": meta.get('chunk_index', 0),
                     "total_chunks": meta.get('total_chunks', 1),
                 })
@@ -521,21 +592,34 @@ class RAGService:
             return {"success": False, "message": f"Error deleting user vectors: {str(e)}"}
 
     def get_user_stats(self, user_id: str) -> Dict[str, Any]:
-        """Return Pinecone index stats for the user."""
         try:
             index = self._ensure_user_index(user_id)
             stats = index.describe_index_stats()
-            total_vectors = stats['total_vector_count']
+            total_sections = stats['total_vector_count']
+
+            pipeline = [
+                {"$match": {"user_id": user_id}},
+                {"$group": {
+                    "_id": "$upload_id",
+                    "filename": {"$first": "$filename"},
+                    "sections_count": {"$sum": 1},
+                    "total_chars": {"$sum": "$char_count"}
+                }}
+            ]
+
+            uploads = list(self.documents_collection.aggregate(pipeline))
 
             return {
                 "success": True,
-                "total_indexed_vectors": total_vectors,
+                "total_indexed_sections": total_sections,
+                "total_documents": len(uploads),
+                "documents": uploads
             }
 
         except Exception as e:
             return {"success": False, "message": f"Error getting stats: {str(e)}"}
 
-    # ── Answer generation ────────────────────────────────────────────────────
+    # ── FIX 2: Upgraded generate_answer with conversational handling ──────────
 
     def generate_answer(
         self,
@@ -547,9 +631,6 @@ class RAGService:
         """
         Generate an answer for any user query.
 
-        CHANGED: text_content is read directly from Pinecone search results.
-        No secondary MongoDB lookup is performed.
-
         Decision flow:
           1. Conversational / greeting  →  direct Gemini response (no RAG)
           2. No indexed documents        →  general Gemini response + nudge to upload
@@ -557,11 +638,11 @@ class RAGService:
           4. Good document match         →  full RAG response with citations
         """
         try:
-            # Step 1: Handle conversational queries immediately
+            # ── Step 1: Handle conversational queries immediately ──────────
             if self._is_conversational(query):
                 return self._generate_conversational_response(query)
 
-            # Step 2: Semantic search in Pinecone
+            # ── Step 2: Try RAG search ────────────────────────────────────
             search_results = self.search(
                 user_id=user_id,
                 query=query,
@@ -569,35 +650,46 @@ class RAGService:
                 upload_id=upload_id
             )
 
+            # No documents indexed at all → answer from general knowledge
             if not search_results["success"]:
                 return self._generate_general_response(query)
 
             results = search_results.get("results", [])
 
+            # No matches returned
             if not results:
                 return self._generate_general_response(query)
 
-            # Step 3: Check similarity threshold
+            # ── Step 3: Check similarity threshold ────────────────────────
+            # If the best match is below 0.40 the query is probably unrelated
+            # to the uploaded documents — fall back to general knowledge.
             SIMILARITY_THRESHOLD = 0.40
             max_similarity = max(r["similarity"] for r in results)
             if max_similarity < SIMILARITY_THRESHOLD:
                 return self._generate_general_response(query)
 
-            # Step 4: Full RAG pipeline — text comes from Pinecone metadata directly
+            # ── Step 4: Full RAG pipeline ─────────────────────────────────
             context_parts = []
             sources = []
             total_context_chars = 0
             max_per_section = self.max_context_chars // top_k
 
             for i, result in enumerate(results, 1):
-                # CHANGED: text_content is already in the search result — no MongoDB needed
-                text_content = result.get('text_content', '')
+                try:
+                    doc = self.documents_collection.find_one(
+                        {"_id": ObjectId(result["original_doc_ref"])}
+                    )
+                    text_content = doc.get('text_content', "") if doc else ""
+                except Exception:
+                    text_content = ""
 
                 if not text_content:
                     continue
 
                 if len(text_content) > max_per_section:
-                    text_content = self._smart_truncate_context(text_content, max_per_section)
+                    text_content = self._smart_truncate_context(
+                        text_content, max_per_section
+                    )
 
                 context_parts.append(
                     f"[Document {i}]\n"
@@ -685,6 +777,7 @@ Your answer:"""
 
             answer = response.text
 
+            # Clean up any stray list formatting artifacts
             answer = re.sub(r'^\s*[\*\-]\s+', '', answer, flags=re.MULTILINE)
             answer = re.sub(r'^\s*\d+\.\s+', '', answer, flags=re.MULTILINE)
             answer = re.sub(r'\n\s*\n\s*\n+', '\n\n', answer)
