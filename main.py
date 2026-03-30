@@ -21,6 +21,82 @@ from pydantic import BaseModel, EmailStr, field_validator
 # Load environment variables
 load_dotenv()
 
+# ─── Chunking Configuration ──────────────────────────────────────────────────
+# Fix 3: Replace fixed 6-page window with character-based chunking
+# Fix 4: Enforce a minimum chunk size so near-empty chunks are discarded
+CHUNK_SIZE    = 4000   # target characters per chunk in fallback mode
+CHUNK_OVERLAP = 400    # overlap between consecutive chunks (preserves boundary context)
+MIN_CHUNK_SIZE = 200   # chunks smaller than this are discarded
+
+
+def split_text_with_overlap(
+    text: str,
+    chunk_size: int = CHUNK_SIZE,
+    chunk_overlap: int = CHUNK_OVERLAP,
+    min_chunk_size: int = MIN_CHUNK_SIZE,
+) -> list[str]:
+    """
+    Split *text* into overlapping chunks that respect natural language boundaries.
+
+    Priority for break-points (highest → lowest):
+      1. Paragraph break  (\\n\\n)
+      2. Sentence end     ('. ')
+      3. Line break       (\\n)
+      4. Word boundary    (' ')
+      5. Hard cut         (arbitrary character position)
+
+    The *chunk_overlap* region is preserved at the start of each new chunk so
+    that context spanning a boundary is not lost during retrieval.
+    """
+    if not text or len(text.strip()) < min_chunk_size:
+        return []
+
+    text = text.strip()
+
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks: list[str] = []
+    start = 0
+
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+
+        if end == len(text):
+            chunk = text[start:].strip()
+            if len(chunk) >= min_chunk_size:
+                chunks.append(chunk)
+            break
+
+        # Search for the best break-point within the window
+        break_point = -1
+        for sep in ['\n\n', '. ', '\n', ' ']:
+            bp = text.rfind(sep, start, end)
+            if bp != -1 and bp > start:
+                break_point = bp + len(sep)   # include separator in the left chunk
+                break
+
+        if break_point == -1:
+            break_point = end   # hard cut — no natural boundary found
+
+        chunk = text[start:break_point].strip()
+        if len(chunk) >= min_chunk_size:
+            chunks.append(chunk)
+
+        # Slide forward, stepping back by overlap to capture boundary context
+        start = max(start + 1, break_point - chunk_overlap)
+
+        # Snap the new start to the nearest natural boundary within the overlap
+        # window so we don't begin mid-sentence when possible.
+        snap_end = min(start + chunk_overlap // 2, len(text))
+        for sep in ['\n\n', '\n', '. ']:
+            bp = text.find(sep, start, snap_end)
+            if bp != -1:
+                start = bp + len(sep)
+                break
+
+    return chunks
+
 app = FastAPI()
 
 # CORS configuration
@@ -277,45 +353,88 @@ def extract_sections_advanced(doc):
             print(f"Detected {len(matches)} sections using pattern {pattern_idx + 1}")
             break
 
+    chars_per_page = len(full_text) / len(doc) if len(doc) > 0 else 1000
+
     if detected_sections and len(detected_sections) >= 2:
+        # ── Fix 1 & 4: Structure-based path ─────────────────────────────────
+        # Sub-chunk any section that is too large to embed faithfully, and
+        # discard any section whose content falls below MIN_CHUNK_SIZE.
         for i, match in enumerate(detected_sections):
             section_title = match.group(0).strip()
             start_pos = match.start()
-            end_pos = detected_sections[i + 1].start() if i + 1 < len(detected_sections) else len(full_text)
+            end_pos = (
+                detected_sections[i + 1].start()
+                if i + 1 < len(detected_sections)
+                else len(full_text)
+            )
             section_text = full_text[start_pos:end_pos].strip()
 
+            # Fix 4: skip near-empty sections
+            if len(section_text) < MIN_CHUNK_SIZE:
+                print(f"  Skipping tiny section '{section_title}' ({len(section_text)} chars)")
+                continue
+
             chars_before = len(full_text[:start_pos])
-            chars_per_page = len(full_text) / len(doc) if len(doc) > 0 else 1000
             start_page = max(1, int(chars_before / chars_per_page) + 1)
             pages_in_section = max(1, int(len(section_text) / chars_per_page))
             end_page = min(len(doc), start_page + pages_in_section)
 
-            sections_data.append({
-                'section_title': section_title,
-                'start_page': start_page,
-                'end_page': end_page,
-                'text_content': section_text,
-                'section_type': 'detected',
-                'char_count': len(section_text)
-            })
+            # Fix 1: sub-chunk large sections so no single embedding is lossy
+            if len(section_text) > CHUNK_SIZE:
+                sub_chunks = split_text_with_overlap(section_text)
+                for sub_idx, sub_text in enumerate(sub_chunks, start=1):
+                    sub_title = (
+                        f"{section_title} (part {sub_idx}/{len(sub_chunks)})"
+                        if len(sub_chunks) > 1
+                        else section_title
+                    )
+                    sections_data.append({
+                        'section_title': sub_title,
+                        'start_page': start_page,
+                        'end_page': end_page,
+                        'text_content': sub_text,
+                        'section_type': 'detected_sub',
+                        'char_count': len(sub_text)
+                    })
+            else:
+                sections_data.append({
+                    'section_title': section_title,
+                    'start_page': start_page,
+                    'end_page': end_page,
+                    'text_content': section_text,
+                    'section_type': 'detected',
+                    'char_count': len(section_text)
+                })
     else:
-        print("No clear sections detected. Using intelligent chunking...")
+        # ── Fix 2, 3 & 4: Fallback path ─────────────────────────────────────
+        # Replace the fixed 6-page window with character-based chunking that
+        # uses sentence/paragraph-aware overlap so boundary context is never lost.
+        print("No clear sections detected. Using overlap-aware character chunking...")
+
         if len(doc) <= 5:
-            sections_data.append({
-                'section_title': 'Complete Document',
-                'start_page': 1,
-                'end_page': len(doc),
-                'text_content': full_text,
-                'section_type': 'full_document',
-                'char_count': len(full_text)
-            })
+            # Tiny document: one chunk is fine, but still enforce minimum size
+            if len(full_text) >= MIN_CHUNK_SIZE:
+                sections_data.append({
+                    'section_title': 'Complete Document',
+                    'start_page': 1,
+                    'end_page': len(doc),
+                    'text_content': full_text,
+                    'section_type': 'full_document',
+                    'char_count': len(full_text)
+                })
         else:
-            chunk_size = 6
-            for i in range(0, len(page_texts), chunk_size):
-                chunk_pages = page_texts[i:i + chunk_size]
-                start_page = chunk_pages[0]['page_number']
-                end_page = chunk_pages[-1]['page_number']
-                chunk_text = "\n\n".join([p['text'] for p in chunk_pages])
+            # Fix 3: character-based overlap chunking instead of 6-page windows
+            text_chunks = split_text_with_overlap(full_text)
+            cumulative = 0
+            for chunk_text in text_chunks:
+                # Estimate page range from character position
+                start_page = max(1, int(cumulative / chars_per_page) + 1)
+                end_page = min(
+                    len(doc),
+                    int((cumulative + len(chunk_text)) / chars_per_page) + 1
+                )
+
+                # Infer a title from the first meaningful line
                 chunk_title = None
                 for line in chunk_text.split('\n')[:10]:
                     line = line.strip()
@@ -323,15 +442,25 @@ def extract_sections_advanced(doc):
                         chunk_title = line
                         break
                 if not chunk_title:
-                    chunk_title = f"Pages {start_page}-{end_page}"
+                    chunk_title = f"Pages {start_page}–{end_page}"
+
+                # Fix 4: skip if still below minimum (edge-case guard)
+                if len(chunk_text) < MIN_CHUNK_SIZE:
+                    print(f"  Skipping tiny fallback chunk ({len(chunk_text)} chars)")
+                    cumulative += len(chunk_text)
+                    continue
+
                 sections_data.append({
                     'section_title': chunk_title,
                     'start_page': start_page,
                     'end_page': end_page,
                     'text_content': chunk_text,
-                    'section_type': 'page_chunk',
+                    'section_type': 'overlap_chunk',
                     'char_count': len(chunk_text)
                 })
+
+                # Advance past the non-overlapping portion
+                cumulative += max(1, len(chunk_text) - CHUNK_OVERLAP)
 
     total_extracted = sum(s['char_count'] for s in sections_data)
     print(f"\nExtraction Summary:")

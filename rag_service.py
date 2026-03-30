@@ -68,6 +68,15 @@ class RAGService:
         # Context management
         self.max_context_chars = 80000
 
+        # ── Chunking configuration (Fix 1, 2) ───────────────────────────────
+        # Sections larger than this are split into overlapping sub-chunks at
+        # index time so every vector represents a focused, complete passage
+        # rather than a lossy sampled digest of a very large block of text.
+        self.index_chunk_size    = 1500   # characters per Pinecone vector
+        self.index_chunk_overlap = 200    # overlap to preserve boundary context
+        self.min_chunk_size      = 150    # sub-chunks smaller than this are skipped
+        # ────────────────────────────────────────────────────────────────────
+
         # ── FIX 2: Conversational intent keywords ────────────────────────────
         self._greeting_tokens = {
             'hi', 'hello', 'hey', 'howdy', 'hiya', 'yo', 'sup', 'greetings',
@@ -84,6 +93,64 @@ class RAGService:
         # ────────────────────────────────────────────────────────────────────
 
     # ── helpers ─────────────────────────────────────────────────────────────
+
+    def _split_into_chunks(self, text: str) -> List[str]:
+        """
+        Fix 1 & 2: Split *text* into overlapping character-based chunks that
+        respect natural language boundaries (paragraph → sentence → line → word).
+
+        This replaces the old lossy truncation that sampled only the start,
+        middle, and end of large sections, discarding everything in between.
+        Each chunk is small enough to be embedded faithfully and overlaps its
+        neighbours by *self.index_chunk_overlap* characters so that passages
+        spanning a chunk boundary are still retrievable.
+        """
+        text = text.strip()
+        if not text or len(text) < self.min_chunk_size:
+            return []
+
+        if len(text) <= self.index_chunk_size:
+            return [text]
+
+        chunks: List[str] = []
+        start = 0
+
+        while start < len(text):
+            end = min(start + self.index_chunk_size, len(text))
+
+            if end == len(text):
+                chunk = text[start:].strip()
+                if len(chunk) >= self.min_chunk_size:
+                    chunks.append(chunk)
+                break
+
+            # Find the best natural break-point within the window
+            break_point = -1
+            for sep in ['\n\n', '. ', '\n', ' ']:
+                bp = text.rfind(sep, start, end)
+                if bp != -1 and bp > start:
+                    break_point = bp + len(sep)
+                    break
+
+            if break_point == -1:
+                break_point = end  # hard cut — no natural boundary found
+
+            chunk = text[start:break_point].strip()
+            if len(chunk) >= self.min_chunk_size:
+                chunks.append(chunk)
+
+            # Slide forward while preserving overlap context
+            start = max(start + 1, break_point - self.index_chunk_overlap)
+
+            # Snap start to the nearest natural boundary inside the overlap window
+            snap_end = min(start + self.index_chunk_overlap // 2, len(text))
+            for sep in ['\n\n', '\n', '. ']:
+                bp = text.find(sep, start, snap_end)
+                if bp != -1:
+                    start = bp + len(sep)
+                    break
+
+        return chunks
 
     def _get_user_index_name(self, user_id: str) -> str:
         user_hash = hashlib.md5(user_id.encode()).hexdigest()
@@ -126,16 +193,14 @@ class RAGService:
         return self.pc.Index(index_name)
 
     def _generate_embedding(self, text: str) -> np.ndarray:
-        """Generate embedding for document indexing (gemini-embedding-001)."""
-        try:
-            if len(text) > 10000:
-                parts = [
-                    text[:3000],
-                    text[len(text) // 2 - 1500: len(text) // 2 + 1500],
-                    text[-3000:]
-                ]
-                text = "\n...\n".join(parts)
+        """
+        Generate an embedding for a single text chunk (gemini-embedding-001).
 
+        Callers are responsible for splitting large texts into sub-chunks
+        via _split_into_chunks() *before* calling this method.  The old
+        lossy three-region sampling has been removed (Fix 1).
+        """
+        try:
             result = genai.embed_content(
                 model=self.embedding_model_name,
                 content=text,
@@ -323,7 +388,13 @@ class RAGService:
     # ── core RAG methods ─────────────────────────────────────────────────────
 
     def index_document(self, user_id: str, upload_id: str) -> Dict[str, Any]:
-        """Index document sections into Pinecone."""
+        """
+        Index document sections into Pinecone.
+
+        Fix 1 & 2: Each section is split into overlapping sub-chunks.
+        One Pinecone vector is created per sub-chunk, so large sections are
+        represented faithfully rather than by a single lossy embedding.
+        """
         try:
             documents = list(self.documents_collection.find({
                 "user_id": user_id,
@@ -339,46 +410,78 @@ class RAGService:
 
             vectors = []
             total_chars = 0
+            total_chunks = 0
 
             for doc in documents:
                 if not doc.get('text_content'):
                     print(f"  Skipping section {doc.get('section_number')} - no content")
                     continue
 
+                # Build the enriched text the same way as before (title + metadata header)
                 searchable_text = self._create_document_text(doc)
-                total_chars += len(searchable_text)
 
-                embedding = self._generate_embedding(searchable_text).tolist()
-                doc_id = self._generate_document_id(doc)
+                # Fix 1: split into sub-chunks instead of one lossy embedding
+                sub_chunks = self._split_into_chunks(searchable_text)
+                if not sub_chunks:
+                    print(f"  Skipping section {doc.get('section_number')} - below min chunk size")
+                    continue
 
-                vectors.append({
-                    "id": doc_id,
-                    "values": embedding,
-                    "metadata": {
-                        "upload_id": upload_id,
-                        "section_number": doc['section_number'],
-                        "filename": doc['filename'],
-                        "section_title": doc['section_title'],
-                        "original_doc_ref": str(doc['_id']),
-                        "pdf_author": doc.get('pdf_metadata', {}).get('author', ''),
-                        "pdf_title": doc.get('pdf_metadata', {}).get('title', ''),
-                        "pdf_subject": doc.get('pdf_metadata', {}).get('subject', ''),
-                        "char_count": len(doc.get('text_content', ''))
-                    }
-                })
+                base_doc_id = self._generate_document_id(doc)
+                section_chars = len(doc.get('text_content', ''))
+                total_chars += section_chars
 
-                print(f"  ✓ Section {doc['section_number']}: {len(doc.get('text_content', ''))} chars")
+                for chunk_idx, chunk_text in enumerate(sub_chunks):
+                    embedding = self._generate_embedding(chunk_text).tolist()
+
+                    # Unique vector ID per sub-chunk: base_id + chunk index
+                    vector_id = f"{base_doc_id}_c{chunk_idx}"
+
+                    vectors.append({
+                        "id": vector_id,
+                        "values": embedding,
+                        "metadata": {
+                            "upload_id": upload_id,
+                            "section_number": doc['section_number'],
+                            "filename": doc['filename'],
+                            "section_title": doc['section_title'],
+                            "original_doc_ref": str(doc['_id']),
+                            "pdf_author": doc.get('pdf_metadata', {}).get('author', ''),
+                            "pdf_title": doc.get('pdf_metadata', {}).get('title', ''),
+                            "pdf_subject": doc.get('pdf_metadata', {}).get('subject', ''),
+                            "char_count": section_chars,
+                            # Store which sub-chunk this vector represents
+                            "chunk_index": chunk_idx,
+                            "total_chunks": len(sub_chunks),
+                        }
+                    })
+                    total_chunks += 1
+
+                print(
+                    f"  ✓ Section {doc['section_number']}: "
+                    f"{section_chars} chars → {len(sub_chunks)} sub-chunk(s)"
+                )
 
             if vectors:
-                index.upsert(vectors=vectors, namespace="")
-                print(f"\n✓ Indexed {len(vectors)} sections ({total_chars:,} total characters)")
+                # Upsert in batches of 100 to stay within Pinecone limits
+                batch_size = 100
+                for i in range(0, len(vectors), batch_size):
+                    index.upsert(vectors=vectors[i:i + batch_size], namespace="")
+
+                print(
+                    f"\n✓ Indexed {len(documents)} sections as {total_chunks} "
+                    f"sub-chunks ({total_chars:,} total characters)"
+                )
 
             return {
                 "success": True,
-                "indexed_sections": len(vectors),
+                "indexed_sections": len(documents),
+                "indexed_chunks": total_chunks,
                 "total_characters": total_chars,
                 "upload_id": upload_id,
-                "message": f"Successfully indexed {len(vectors)} sections in Pinecone"
+                "message": (
+                    f"Successfully indexed {len(documents)} sections "
+                    f"as {total_chunks} sub-chunks in Pinecone"
+                )
             }
 
         except Exception as e:
@@ -392,7 +495,15 @@ class RAGService:
         top_k: int = 5,
         upload_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Semantic search through a user's Pinecone index."""
+        """
+        Semantic search through a user's Pinecone index.
+
+        Fix 2: Because each section is now represented by multiple sub-chunk
+        vectors, raw Pinecone results can contain several hits from the same
+        section.  We deduplicate by *original_doc_ref*, keeping only the
+        highest-scoring chunk per section, then return up to *top_k* unique
+        sections so the caller always sees diverse, non-repetitive results.
+        """
         try:
             index = self._ensure_user_index(user_id)
 
@@ -402,9 +513,13 @@ class RAGService:
             if upload_id:
                 filter_dict["upload_id"] = upload_id
 
+            # Request more candidates than top_k so deduplication still leaves
+            # enough unique sections after merging sub-chunk hits.
+            raw_top_k = top_k * 4
+
             results = index.query(
                 vector=query_embedding,
-                top_k=top_k,
+                top_k=raw_top_k,
                 include_metadata=True,
                 namespace="",
                 filter=filter_dict if filter_dict else None
@@ -413,8 +528,18 @@ class RAGService:
             if not results.matches:
                 return {"success": False, "message": "No indexed documents available"}
 
-            processed_results = []
+            # ── Deduplication: keep best-scoring chunk per section ───────────
+            seen: Dict[str, Any] = {}   # original_doc_ref → best match so far
             for match in results.matches:
+                ref = match.metadata.get('original_doc_ref', match.id)
+                if ref not in seen or match.score > seen[ref].score:
+                    seen[ref] = match
+
+            # Re-sort by score descending and take top_k unique sections
+            deduped = sorted(seen.values(), key=lambda m: m.score, reverse=True)[:top_k]
+
+            processed_results = []
+            for match in deduped:
                 meta = match.metadata
                 processed_results.append({
                     "section_number": meta['section_number'],
@@ -426,7 +551,10 @@ class RAGService:
                     "pdf_author": meta.get('pdf_author', ''),
                     "pdf_title": meta.get('pdf_title', ''),
                     "pdf_subject": meta.get('pdf_subject', ''),
-                    "char_count": meta.get('char_count', 0)
+                    "char_count": meta.get('char_count', 0),
+                    # Expose sub-chunk info for debugging / transparency
+                    "chunk_index": meta.get('chunk_index', 0),
+                    "total_chunks": meta.get('total_chunks', 1),
                 })
 
             return {"success": True, "results": processed_results, "query": query}
