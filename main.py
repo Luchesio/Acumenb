@@ -775,6 +775,31 @@ async def get_rag_stats(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/reset-my-index")
+async def reset_my_index(current_user: dict = Depends(get_current_user)):
+    """
+    Wipes ALL Pinecone vectors AND all pdf_uploads metadata for this user.
+    Use this once to clear stale vectors before re-uploading your PDFs.
+    """
+    try:
+        # Delete entire Pinecone index for this user
+        pinecone_result = rag_service.delete_user_vectors(current_user["user_id"])
+
+        # Clear all upload metadata from MongoDB
+        mongo_result = pdf_uploads_collection.delete_many(
+            {"user_id": current_user["user_id"]}
+        )
+
+        return {
+            "success": True,
+            "message": "All vectors and document metadata cleared. You can now re-upload your PDFs.",
+            "pinecone": pinecone_result,
+            "metadata_records_deleted": mongo_result.deleted_count,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
