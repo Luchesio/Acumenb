@@ -14,7 +14,7 @@ import hashlib
 import ssl
 from rag_service import get_rag_service
 import csv
-import bcrypt
+from bson import ObjectId
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr, field_validator
 
@@ -739,10 +739,13 @@ async def rag_search(
             return results
         enhanced_results = []
         for result in results["results"]:
-            doc = documents_collection.find_one(
-                {"_id": result["original_doc_ref"]},
-                {"pdf_metadata": 1, "start_page": 1, "end_page": 1, "text_content": 1, "section_number": 1}
-            )
+            try:
+                doc = documents_collection.find_one(
+                    {"_id": ObjectId(result["original_doc_ref"])},  # Fix 3: cast to ObjectId
+                    {"pdf_metadata": 1, "start_page": 1, "end_page": 1, "text_content": 1, "section_number": 1}
+                )
+            except Exception:
+                doc = None
             if doc:
                 result["pdf_metadata"] = doc.get("pdf_metadata", {})
                 result["start_page"] = doc.get("start_page")

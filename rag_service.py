@@ -157,19 +157,21 @@ class RAGService:
         return f"user-{user_hash}"
 
     def _ensure_user_index(self, user_id: str):
-        """Create or retrieve the user's Pinecone index (3072-dim)."""
-        index_name = self._get_user_index_name(user_id)
+        """
+        Create or retrieve the user's Pinecone index (3072-dim).
 
+        Fix 4: Wait for async deletion to complete before recreating.
+        Fix 1: When dimension mismatch is detected, flag that all of this
+               user's documents must be re-indexed into the new index.
+        """
+        import time
+
+        index_name = self._get_user_index_name(user_id)
         existing = self.pc.list_indexes().names()
+        self._reindex_required = False  # reset flag each call
 
         if index_name in existing:
-            # Check whether the existing index has the right dimension.
-            # If it was created with the old model (768) we delete and recreate.
             try:
-                idx = self.pc.Index(index_name)
-                stats = idx.describe_index_stats()
-                # Pinecone doesn't expose dimension in stats directly,
-                # but we can probe via the index description.
                 desc = self.pc.describe_index(index_name)
                 if desc.dimension != self.embedding_dimension:
                     print(
@@ -178,7 +180,18 @@ class RAGService:
                         "Deleting and recreating …"
                     )
                     self.pc.delete_index(index_name)
+
+                    # Fix 4: Poll until Pinecone confirms deletion (async op)
+                    for _ in range(30):
+                        time.sleep(2)
+                        if index_name not in self.pc.list_indexes().names():
+                            break
+                    else:
+                        print(f"Warning: index '{index_name}' may not be fully deleted yet.")
+
                     existing = []  # force recreation below
+                    # Fix 1: mark that documents need to be re-indexed
+                    self._reindex_required = True
             except Exception as e:
                 print(f"Warning during index dimension check: {e}")
 
@@ -189,6 +202,15 @@ class RAGService:
                 metric="cosine",
                 spec=ServerlessSpec(cloud="aws", region="us-east-1")
             )
+            # Wait for index to be ready before returning
+            for _ in range(30):
+                time.sleep(2)
+                try:
+                    ready = self.pc.describe_index(index_name).status.get("ready", False)
+                    if ready:
+                        break
+                except Exception:
+                    pass
 
         return self.pc.Index(index_name)
 
@@ -332,22 +354,33 @@ class RAGService:
                 "response_type": "conversational"
             }
 
-    def _generate_general_response(self, query: str) -> Dict[str, Any]:
+    def _generate_general_response(self, query: str, hint: str = "no_match") -> Dict[str, Any]:
         """
         Answer a non-conversational query that has no relevant document matches.
-        Gemini answers from its own knowledge and gracefully notes the context.
+        Gemini answers from its own knowledge and gives an accurate, honest note
+        about why documents weren't used (query mismatch vs low similarity).
         """
+        if hint == "low_similarity":
+            doc_note = (
+                "The user has uploaded documents, but none of them appear to contain "
+                "information relevant to this specific question. Answer from your own "
+                "knowledge, and at the end politely note that the uploaded documents "
+                "don't seem to cover this topic — but they are still available for "
+                "other questions."
+            )
+        else:  # no_match
+            doc_note = (
+                "The user's documents don't contain a clear answer to this question. "
+                "Answer from your own knowledge as helpfully as possible. At the end, "
+                "gently suggest they upload a relevant document for more precise, "
+                "source-backed answers."
+            )
+
         try:
             system_prompt = (
-                "You are Acumen, an intelligent AI assistant on a document Q&A "
-                "platform. The user has asked a question, but either no documents "
-                "have been uploaded yet or none of the uploaded documents contain "
-                "relevant information. "
-                "Answer the question from your own knowledge as helpfully as "
-                "possible. If the topic is very niche or you're uncertain, say so "
-                "honestly. At the end, gently remind the user that you can give "
-                "much more precise, source-backed answers if they upload relevant "
-                "documents. Keep the tone warm and professional."
+                "You are Acumen, an intelligent AI assistant on a document Q&A platform. "
+                + doc_note +
+                " Keep the tone warm and professional."
             )
 
             model = genai.GenerativeModel(
@@ -387,102 +420,132 @@ class RAGService:
 
     # ── core RAG methods ─────────────────────────────────────────────────────
 
+    def _reindex_all_user_uploads(self, user_id: str) -> None:
+        """
+        Re-index every upload belonging to *user_id* from MongoDB into Pinecone.
+        Called automatically when a stale index (wrong dimension) is rebuilt.
+        """
+        pipeline = [
+            {"$match": {"user_id": user_id}},
+            {"$group": {"_id": "$upload_id"}}
+        ]
+        upload_ids = [doc["_id"] for doc in self.documents_collection.aggregate(pipeline)]
+        if not upload_ids:
+            print("No uploads found to re-index.")
+            return
+
+        print(f"\n⚙️  Auto re-indexing {len(upload_ids)} upload(s) for user {user_id} …")
+        for uid in upload_ids:
+            result = self._index_single_upload(user_id, uid)
+            status = "✓" if result["success"] else "✗"
+            print(f"  {status} upload_id={uid}: {result.get('message', '')}")
+
+    def _index_single_upload(self, user_id: str, upload_id: str, index=None) -> Dict[str, Any]:
+        """
+        Core indexing logic for one upload_id. *index* is reused when the
+        caller already holds a handle (avoids redundant Pinecone round-trips).
+        """
+        documents = list(self.documents_collection.find({
+            "user_id": user_id,
+            "upload_id": upload_id
+        }).sort("section_number", 1))
+
+        if not documents:
+            return {"success": False, "message": "No documents found for this upload_id"}
+
+        if index is None:
+            index = self._ensure_user_index(user_id)
+
+        vectors = []
+        total_chars = 0
+        total_chunks = 0
+
+        for doc in documents:
+            if not doc.get('text_content'):
+                print(f"  Skipping section {doc.get('section_number')} - no content")
+                continue
+
+            searchable_text = self._create_document_text(doc)
+            sub_chunks = self._split_into_chunks(searchable_text)
+            if not sub_chunks:
+                print(f"  Skipping section {doc.get('section_number')} - below min chunk size")
+                continue
+
+            base_doc_id = self._generate_document_id(doc)
+            section_chars = len(doc.get('text_content', ''))
+            total_chars += section_chars
+
+            for chunk_idx, chunk_text in enumerate(sub_chunks):
+                embedding = self._generate_embedding(chunk_text).tolist()
+                vector_id = f"{base_doc_id}_c{chunk_idx}"
+                vectors.append({
+                    "id": vector_id,
+                    "values": embedding,
+                    "metadata": {
+                        "upload_id": upload_id,
+                        "section_number": doc['section_number'],
+                        "filename": doc['filename'],
+                        "section_title": doc['section_title'],
+                        "original_doc_ref": str(doc['_id']),
+                        "pdf_author": doc.get('pdf_metadata', {}).get('author', ''),
+                        "pdf_title": doc.get('pdf_metadata', {}).get('title', ''),
+                        "pdf_subject": doc.get('pdf_metadata', {}).get('subject', ''),
+                        "char_count": section_chars,
+                        "chunk_index": chunk_idx,
+                        "total_chunks": len(sub_chunks),
+                    }
+                })
+                total_chunks += 1
+
+            print(
+                f"  ✓ Section {doc['section_number']}: "
+                f"{section_chars} chars → {len(sub_chunks)} sub-chunk(s)"
+            )
+
+        if vectors:
+            batch_size = 100
+            for i in range(0, len(vectors), batch_size):
+                index.upsert(vectors=vectors[i:i + batch_size], namespace="")
+
+            print(
+                f"\n✓ Indexed {len(documents)} sections as {total_chunks} "
+                f"sub-chunks ({total_chars:,} total characters)"
+            )
+
+        return {
+            "success": True,
+            "indexed_sections": len(documents),
+            "indexed_chunks": total_chunks,
+            "total_characters": total_chars,
+            "upload_id": upload_id,
+            "message": (
+                f"Successfully indexed {len(documents)} sections "
+                f"as {total_chunks} sub-chunks in Pinecone"
+            )
+        }
+
     def index_document(self, user_id: str, upload_id: str) -> Dict[str, Any]:
         """
         Index document sections into Pinecone.
 
         Fix 1 & 2: Each section is split into overlapping sub-chunks.
-        One Pinecone vector is created per sub-chunk, so large sections are
-        represented faithfully rather than by a single lossy embedding.
+        Fix 1 (extended): If _ensure_user_index detected a dimension mismatch
+        and rebuilt an empty index, all existing uploads are automatically
+        re-indexed so no data is silently lost.
         """
         try:
-            documents = list(self.documents_collection.find({
-                "user_id": user_id,
-                "upload_id": upload_id
-            }).sort("section_number", 1))
-
-            if not documents:
-                return {"success": False, "message": "No documents found for this upload_id"}
-
-            print(f"\nIndexing {len(documents)} sections for upload_id: {upload_id}")
+            print(f"\nIndexing {len(list(self.documents_collection.find({'user_id': user_id, 'upload_id': upload_id})))} sections for upload_id: {upload_id}")
 
             index = self._ensure_user_index(user_id)
 
-            vectors = []
-            total_chars = 0
-            total_chunks = 0
+            # Fix 1: If the index was just rebuilt due to a dimension mismatch,
+            # re-index ALL of the user's existing uploads automatically.
+            if getattr(self, '_reindex_required', False):
+                print("\n⚠️  Index was rebuilt (embedding model changed). Auto re-indexing all uploads …")
+                self._reindex_all_user_uploads(user_id)
+                self._reindex_required = False
 
-            for doc in documents:
-                if not doc.get('text_content'):
-                    print(f"  Skipping section {doc.get('section_number')} - no content")
-                    continue
-
-                # Build the enriched text the same way as before (title + metadata header)
-                searchable_text = self._create_document_text(doc)
-
-                # Fix 1: split into sub-chunks instead of one lossy embedding
-                sub_chunks = self._split_into_chunks(searchable_text)
-                if not sub_chunks:
-                    print(f"  Skipping section {doc.get('section_number')} - below min chunk size")
-                    continue
-
-                base_doc_id = self._generate_document_id(doc)
-                section_chars = len(doc.get('text_content', ''))
-                total_chars += section_chars
-
-                for chunk_idx, chunk_text in enumerate(sub_chunks):
-                    embedding = self._generate_embedding(chunk_text).tolist()
-
-                    # Unique vector ID per sub-chunk: base_id + chunk index
-                    vector_id = f"{base_doc_id}_c{chunk_idx}"
-
-                    vectors.append({
-                        "id": vector_id,
-                        "values": embedding,
-                        "metadata": {
-                            "upload_id": upload_id,
-                            "section_number": doc['section_number'],
-                            "filename": doc['filename'],
-                            "section_title": doc['section_title'],
-                            "original_doc_ref": str(doc['_id']),
-                            "pdf_author": doc.get('pdf_metadata', {}).get('author', ''),
-                            "pdf_title": doc.get('pdf_metadata', {}).get('title', ''),
-                            "pdf_subject": doc.get('pdf_metadata', {}).get('subject', ''),
-                            "char_count": section_chars,
-                            # Store which sub-chunk this vector represents
-                            "chunk_index": chunk_idx,
-                            "total_chunks": len(sub_chunks),
-                        }
-                    })
-                    total_chunks += 1
-
-                print(
-                    f"  ✓ Section {doc['section_number']}: "
-                    f"{section_chars} chars → {len(sub_chunks)} sub-chunk(s)"
-                )
-
-            if vectors:
-                # Upsert in batches of 100 to stay within Pinecone limits
-                batch_size = 100
-                for i in range(0, len(vectors), batch_size):
-                    index.upsert(vectors=vectors[i:i + batch_size], namespace="")
-
-                print(
-                    f"\n✓ Indexed {len(documents)} sections as {total_chunks} "
-                    f"sub-chunks ({total_chars:,} total characters)"
-                )
-
-            return {
-                "success": True,
-                "indexed_sections": len(documents),
-                "indexed_chunks": total_chunks,
-                "total_characters": total_chars,
-                "upload_id": upload_id,
-                "message": (
-                    f"Successfully indexed {len(documents)} sections "
-                    f"as {total_chunks} sub-chunks in Pinecone"
-                )
-            }
+            return self._index_single_upload(user_id, upload_id, index=index)
 
         except Exception as e:
             print(f"Error indexing document: {str(e)}")
@@ -526,7 +589,24 @@ class RAGService:
             )
 
             if not results.matches:
-                return {"success": False, "message": "No indexed documents available"}
+                # Fix 2: distinguish between a truly empty index and a query
+                # that simply didn't match any documents — the caller uses
+                # this to give the user an accurate message.
+                try:
+                    stats = index.describe_index_stats()
+                    if stats.get('total_vector_count', 0) == 0:
+                        return {
+                            "success": False,
+                            "reason": "empty_index",
+                            "message": "No documents have been indexed yet. Please upload a PDF first."
+                        }
+                except Exception:
+                    pass
+                return {
+                    "success": False,
+                    "reason": "no_match",
+                    "message": "Your documents don't appear to contain information relevant to this query."
+                }
 
             # ── Deduplication: keep best-scoring chunk per section ───────────
             seen: Dict[str, Any] = {}   # original_doc_ref → best match so far
@@ -650,15 +730,32 @@ class RAGService:
                 upload_id=upload_id
             )
 
-            # No documents indexed at all → answer from general knowledge
+            # No documents indexed at all → tell user to upload
             if not search_results["success"]:
-                return self._generate_general_response(query)
+                reason = search_results.get("reason", "empty_index")
+                if reason == "empty_index":
+                    return {
+                        "success": True,
+                        "answer": (
+                            "It looks like you haven't uploaded any documents yet — "
+                            "or your documents may need to be re-indexed. "
+                            "Please upload a PDF and I'll be able to give you "
+                            "precise, source-backed answers right away!"
+                        ),
+                        "sources": [],
+                        "query": query,
+                        "context_documents_used": 0,
+                        "total_context_chars": 0,
+                        "response_type": "no_documents"
+                    }
+                # reason == "no_match" → answer from general knowledge
+                return self._generate_general_response(query, hint="no_match")
 
             results = search_results.get("results", [])
 
             # No matches returned
             if not results:
-                return self._generate_general_response(query)
+                return self._generate_general_response(query, hint="no_match")
 
             # ── Step 3: Check similarity threshold ────────────────────────
             # If the best match is below 0.40 the query is probably unrelated
@@ -666,7 +763,7 @@ class RAGService:
             SIMILARITY_THRESHOLD = 0.40
             max_similarity = max(r["similarity"] for r in results)
             if max_similarity < SIMILARITY_THRESHOLD:
-                return self._generate_general_response(query)
+                return self._generate_general_response(query, hint="low_similarity")
 
             # ── Step 4: Full RAG pipeline ─────────────────────────────────
             context_parts = []
@@ -711,7 +808,7 @@ class RAGService:
                 })
 
             if not context_parts:
-                return self._generate_general_response(query)
+                return self._generate_general_response(query, hint="no_match")
 
             context = "\n" + "=" * 60 + "\n".join(context_parts)
 
