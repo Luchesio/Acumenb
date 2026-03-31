@@ -68,15 +68,6 @@ class RAGService:
         # Context management
         self.max_context_chars = 80000
 
-        # ── Chunking configuration (Fix 1, 2) ───────────────────────────────
-        # Sections larger than this are split into overlapping sub-chunks at
-        # index time so every vector represents a focused, complete passage
-        # rather than a lossy sampled digest of a very large block of text.
-        self.index_chunk_size    = 1500   # characters per Pinecone vector
-        self.index_chunk_overlap = 200    # overlap to preserve boundary context
-        self.min_chunk_size      = 150    # sub-chunks smaller than this are skipped
-        # ────────────────────────────────────────────────────────────────────
-
         # ── FIX 2: Conversational intent keywords ────────────────────────────
         self._greeting_tokens = {
             'hi', 'hello', 'hey', 'howdy', 'hiya', 'yo', 'sup', 'greetings',
@@ -94,84 +85,24 @@ class RAGService:
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
-    def _split_into_chunks(self, text: str) -> List[str]:
-        """
-        Fix 1 & 2: Split *text* into overlapping character-based chunks that
-        respect natural language boundaries (paragraph → sentence → line → word).
-
-        This replaces the old lossy truncation that sampled only the start,
-        middle, and end of large sections, discarding everything in between.
-        Each chunk is small enough to be embedded faithfully and overlaps its
-        neighbours by *self.index_chunk_overlap* characters so that passages
-        spanning a chunk boundary are still retrievable.
-        """
-        text = text.strip()
-        if not text or len(text) < self.min_chunk_size:
-            return []
-
-        if len(text) <= self.index_chunk_size:
-            return [text]
-
-        chunks: List[str] = []
-        start = 0
-
-        while start < len(text):
-            end = min(start + self.index_chunk_size, len(text))
-
-            if end == len(text):
-                chunk = text[start:].strip()
-                if len(chunk) >= self.min_chunk_size:
-                    chunks.append(chunk)
-                break
-
-            # Find the best natural break-point within the window
-            break_point = -1
-            for sep in ['\n\n', '. ', '\n', ' ']:
-                bp = text.rfind(sep, start, end)
-                if bp != -1 and bp > start:
-                    break_point = bp + len(sep)
-                    break
-
-            if break_point == -1:
-                break_point = end  # hard cut — no natural boundary found
-
-            chunk = text[start:break_point].strip()
-            if len(chunk) >= self.min_chunk_size:
-                chunks.append(chunk)
-
-            # Slide forward while preserving overlap context
-            start = max(start + 1, break_point - self.index_chunk_overlap)
-
-            # Snap start to the nearest natural boundary inside the overlap window
-            snap_end = min(start + self.index_chunk_overlap // 2, len(text))
-            for sep in ['\n\n', '\n', '. ']:
-                bp = text.find(sep, start, snap_end)
-                if bp != -1:
-                    start = bp + len(sep)
-                    break
-
-        return chunks
-
     def _get_user_index_name(self, user_id: str) -> str:
         user_hash = hashlib.md5(user_id.encode()).hexdigest()
         return f"user-{user_hash}"
 
     def _ensure_user_index(self, user_id: str):
-        """
-        Create or retrieve the user's Pinecone index (3072-dim).
-
-        Fix 4: Wait for async deletion to complete before recreating.
-        Fix 1: When dimension mismatch is detected, flag that all of this
-               user's documents must be re-indexed into the new index.
-        """
-        import time
-
+        """Create or retrieve the user's Pinecone index (3072-dim)."""
         index_name = self._get_user_index_name(user_id)
+
         existing = self.pc.list_indexes().names()
-        self._reindex_required = False  # reset flag each call
 
         if index_name in existing:
+            # Check whether the existing index has the right dimension.
+            # If it was created with the old model (768) we delete and recreate.
             try:
+                idx = self.pc.Index(index_name)
+                stats = idx.describe_index_stats()
+                # Pinecone doesn't expose dimension in stats directly,
+                # but we can probe via the index description.
                 desc = self.pc.describe_index(index_name)
                 if desc.dimension != self.embedding_dimension:
                     print(
@@ -180,18 +111,7 @@ class RAGService:
                         "Deleting and recreating …"
                     )
                     self.pc.delete_index(index_name)
-
-                    # Fix 4: Poll until Pinecone confirms deletion (async op)
-                    for _ in range(30):
-                        time.sleep(2)
-                        if index_name not in self.pc.list_indexes().names():
-                            break
-                    else:
-                        print(f"Warning: index '{index_name}' may not be fully deleted yet.")
-
                     existing = []  # force recreation below
-                    # Fix 1: mark that documents need to be re-indexed
-                    self._reindex_required = True
             except Exception as e:
                 print(f"Warning during index dimension check: {e}")
 
@@ -202,27 +122,20 @@ class RAGService:
                 metric="cosine",
                 spec=ServerlessSpec(cloud="aws", region="us-east-1")
             )
-            # Wait for index to be ready before returning
-            for _ in range(30):
-                time.sleep(2)
-                try:
-                    ready = self.pc.describe_index(index_name).status.get("ready", False)
-                    if ready:
-                        break
-                except Exception:
-                    pass
 
         return self.pc.Index(index_name)
 
     def _generate_embedding(self, text: str) -> np.ndarray:
-        """
-        Generate an embedding for a single text chunk (gemini-embedding-001).
-
-        Callers are responsible for splitting large texts into sub-chunks
-        via _split_into_chunks() *before* calling this method.  The old
-        lossy three-region sampling has been removed (Fix 1).
-        """
+        """Generate embedding for document indexing (gemini-embedding-001)."""
         try:
+            if len(text) > 10000:
+                parts = [
+                    text[:3000],
+                    text[len(text) // 2 - 1500: len(text) // 2 + 1500],
+                    text[-3000:]
+                ]
+                text = "\n...\n".join(parts)
+
             result = genai.embed_content(
                 model=self.embedding_model_name,
                 content=text,
@@ -354,33 +267,22 @@ class RAGService:
                 "response_type": "conversational"
             }
 
-    def _generate_general_response(self, query: str, hint: str = "no_match") -> Dict[str, Any]:
+    def _generate_general_response(self, query: str) -> Dict[str, Any]:
         """
         Answer a non-conversational query that has no relevant document matches.
-        Gemini answers from its own knowledge and gives an accurate, honest note
-        about why documents weren't used (query mismatch vs low similarity).
+        Gemini answers from its own knowledge and gracefully notes the context.
         """
-        if hint == "low_similarity":
-            doc_note = (
-                "The user has uploaded documents, but none of them appear to contain "
-                "information relevant to this specific question. Answer from your own "
-                "knowledge, and at the end politely note that the uploaded documents "
-                "don't seem to cover this topic — but they are still available for "
-                "other questions."
-            )
-        else:  # no_match
-            doc_note = (
-                "The user's documents don't contain a clear answer to this question. "
-                "Answer from your own knowledge as helpfully as possible. At the end, "
-                "gently suggest they upload a relevant document for more precise, "
-                "source-backed answers."
-            )
-
         try:
             system_prompt = (
-                "You are Acumen, an intelligent AI assistant on a document Q&A platform. "
-                + doc_note +
-                " Keep the tone warm and professional."
+                "You are Acumen, an intelligent AI assistant on a document Q&A "
+                "platform. The user has asked a question, but either no documents "
+                "have been uploaded yet or none of the uploaded documents contain "
+                "relevant information. "
+                "Answer the question from your own knowledge as helpfully as "
+                "possible. If the topic is very niche or you're uncertain, say so "
+                "honestly. At the end, gently remind the user that you can give "
+                "much more precise, source-backed answers if they upload relevant "
+                "documents. Keep the tone warm and professional."
             )
 
             model = genai.GenerativeModel(
@@ -420,66 +322,37 @@ class RAGService:
 
     # ── core RAG methods ─────────────────────────────────────────────────────
 
-    def _reindex_all_user_uploads(self, user_id: str) -> None:
-        """
-        Re-index every upload belonging to *user_id* from MongoDB into Pinecone.
-        Called automatically when a stale index (wrong dimension) is rebuilt.
-        """
-        pipeline = [
-            {"$match": {"user_id": user_id}},
-            {"$group": {"_id": "$upload_id"}}
-        ]
-        upload_ids = [doc["_id"] for doc in self.documents_collection.aggregate(pipeline)]
-        if not upload_ids:
-            print("No uploads found to re-index.")
-            return
+    def index_document(self, user_id: str, upload_id: str) -> Dict[str, Any]:
+        """Index document sections into Pinecone."""
+        try:
+            documents = list(self.documents_collection.find({
+                "user_id": user_id,
+                "upload_id": upload_id
+            }).sort("section_number", 1))
 
-        print(f"\n⚙️  Auto re-indexing {len(upload_ids)} upload(s) for user {user_id} …")
-        for uid in upload_ids:
-            result = self._index_single_upload(user_id, uid)
-            status = "✓" if result["success"] else "✗"
-            print(f"  {status} upload_id={uid}: {result.get('message', '')}")
+            if not documents:
+                return {"success": False, "message": "No documents found for this upload_id"}
 
-    def _index_single_upload(self, user_id: str, upload_id: str, index=None) -> Dict[str, Any]:
-        """
-        Core indexing logic for one upload_id. *index* is reused when the
-        caller already holds a handle (avoids redundant Pinecone round-trips).
-        """
-        documents = list(self.documents_collection.find({
-            "user_id": user_id,
-            "upload_id": upload_id
-        }).sort("section_number", 1))
+            print(f"\nIndexing {len(documents)} sections for upload_id: {upload_id}")
 
-        if not documents:
-            return {"success": False, "message": "No documents found for this upload_id"}
-
-        if index is None:
             index = self._ensure_user_index(user_id)
 
-        vectors = []
-        total_chars = 0
-        total_chunks = 0
+            vectors = []
+            total_chars = 0
 
-        for doc in documents:
-            if not doc.get('text_content'):
-                print(f"  Skipping section {doc.get('section_number')} - no content")
-                continue
+            for doc in documents:
+                if not doc.get('text_content'):
+                    print(f"  Skipping section {doc.get('section_number')} - no content")
+                    continue
 
-            searchable_text = self._create_document_text(doc)
-            sub_chunks = self._split_into_chunks(searchable_text)
-            if not sub_chunks:
-                print(f"  Skipping section {doc.get('section_number')} - below min chunk size")
-                continue
+                searchable_text = self._create_document_text(doc)
+                total_chars += len(searchable_text)
 
-            base_doc_id = self._generate_document_id(doc)
-            section_chars = len(doc.get('text_content', ''))
-            total_chars += section_chars
+                embedding = self._generate_embedding(searchable_text).tolist()
+                doc_id = self._generate_document_id(doc)
 
-            for chunk_idx, chunk_text in enumerate(sub_chunks):
-                embedding = self._generate_embedding(chunk_text).tolist()
-                vector_id = f"{base_doc_id}_c{chunk_idx}"
                 vectors.append({
-                    "id": vector_id,
+                    "id": doc_id,
                     "values": embedding,
                     "metadata": {
                         "upload_id": upload_id,
@@ -490,62 +363,23 @@ class RAGService:
                         "pdf_author": doc.get('pdf_metadata', {}).get('author', ''),
                         "pdf_title": doc.get('pdf_metadata', {}).get('title', ''),
                         "pdf_subject": doc.get('pdf_metadata', {}).get('subject', ''),
-                        "char_count": section_chars,
-                        "chunk_index": chunk_idx,
-                        "total_chunks": len(sub_chunks),
+                        "char_count": len(doc.get('text_content', ''))
                     }
                 })
-                total_chunks += 1
 
-            print(
-                f"  ✓ Section {doc['section_number']}: "
-                f"{section_chars} chars → {len(sub_chunks)} sub-chunk(s)"
-            )
+                print(f"  ✓ Section {doc['section_number']}: {len(doc.get('text_content', ''))} chars")
 
-        if vectors:
-            batch_size = 100
-            for i in range(0, len(vectors), batch_size):
-                index.upsert(vectors=vectors[i:i + batch_size], namespace="")
+            if vectors:
+                index.upsert(vectors=vectors, namespace="")
+                print(f"\n✓ Indexed {len(vectors)} sections ({total_chars:,} total characters)")
 
-            print(
-                f"\n✓ Indexed {len(documents)} sections as {total_chunks} "
-                f"sub-chunks ({total_chars:,} total characters)"
-            )
-
-        return {
-            "success": True,
-            "indexed_sections": len(documents),
-            "indexed_chunks": total_chunks,
-            "total_characters": total_chars,
-            "upload_id": upload_id,
-            "message": (
-                f"Successfully indexed {len(documents)} sections "
-                f"as {total_chunks} sub-chunks in Pinecone"
-            )
-        }
-
-    def index_document(self, user_id: str, upload_id: str) -> Dict[str, Any]:
-        """
-        Index document sections into Pinecone.
-
-        Fix 1 & 2: Each section is split into overlapping sub-chunks.
-        Fix 1 (extended): If _ensure_user_index detected a dimension mismatch
-        and rebuilt an empty index, all existing uploads are automatically
-        re-indexed so no data is silently lost.
-        """
-        try:
-            print(f"\nIndexing {len(list(self.documents_collection.find({'user_id': user_id, 'upload_id': upload_id})))} sections for upload_id: {upload_id}")
-
-            index = self._ensure_user_index(user_id)
-
-            # Fix 1: If the index was just rebuilt due to a dimension mismatch,
-            # re-index ALL of the user's existing uploads automatically.
-            if getattr(self, '_reindex_required', False):
-                print("\n⚠️  Index was rebuilt (embedding model changed). Auto re-indexing all uploads …")
-                self._reindex_all_user_uploads(user_id)
-                self._reindex_required = False
-
-            return self._index_single_upload(user_id, upload_id, index=index)
+            return {
+                "success": True,
+                "indexed_sections": len(vectors),
+                "total_characters": total_chars,
+                "upload_id": upload_id,
+                "message": f"Successfully indexed {len(vectors)} sections in Pinecone"
+            }
 
         except Exception as e:
             print(f"Error indexing document: {str(e)}")
@@ -558,15 +392,7 @@ class RAGService:
         top_k: int = 5,
         upload_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Semantic search through a user's Pinecone index.
-
-        Fix 2: Because each section is now represented by multiple sub-chunk
-        vectors, raw Pinecone results can contain several hits from the same
-        section.  We deduplicate by *original_doc_ref*, keeping only the
-        highest-scoring chunk per section, then return up to *top_k* unique
-        sections so the caller always sees diverse, non-repetitive results.
-        """
+        """Semantic search through a user's Pinecone index."""
         try:
             index = self._ensure_user_index(user_id)
 
@@ -576,50 +402,19 @@ class RAGService:
             if upload_id:
                 filter_dict["upload_id"] = upload_id
 
-            # Request more candidates than top_k so deduplication still leaves
-            # enough unique sections after merging sub-chunk hits.
-            raw_top_k = top_k * 4
-
             results = index.query(
                 vector=query_embedding,
-                top_k=raw_top_k,
+                top_k=top_k,
                 include_metadata=True,
                 namespace="",
                 filter=filter_dict if filter_dict else None
             )
 
             if not results.matches:
-                # Fix 2: distinguish between a truly empty index and a query
-                # that simply didn't match any documents — the caller uses
-                # this to give the user an accurate message.
-                try:
-                    stats = index.describe_index_stats()
-                    if stats.get('total_vector_count', 0) == 0:
-                        return {
-                            "success": False,
-                            "reason": "empty_index",
-                            "message": "No documents have been indexed yet. Please upload a PDF first."
-                        }
-                except Exception:
-                    pass
-                return {
-                    "success": False,
-                    "reason": "no_match",
-                    "message": "Your documents don't appear to contain information relevant to this query."
-                }
-
-            # ── Deduplication: keep best-scoring chunk per section ───────────
-            seen: Dict[str, Any] = {}   # original_doc_ref → best match so far
-            for match in results.matches:
-                ref = match.metadata.get('original_doc_ref', match.id)
-                if ref not in seen or match.score > seen[ref].score:
-                    seen[ref] = match
-
-            # Re-sort by score descending and take top_k unique sections
-            deduped = sorted(seen.values(), key=lambda m: m.score, reverse=True)[:top_k]
+                return {"success": False, "message": "No indexed documents available"}
 
             processed_results = []
-            for match in deduped:
+            for match in results.matches:
                 meta = match.metadata
                 processed_results.append({
                     "section_number": meta['section_number'],
@@ -631,10 +426,7 @@ class RAGService:
                     "pdf_author": meta.get('pdf_author', ''),
                     "pdf_title": meta.get('pdf_title', ''),
                     "pdf_subject": meta.get('pdf_subject', ''),
-                    "char_count": meta.get('char_count', 0),
-                    # Expose sub-chunk info for debugging / transparency
-                    "chunk_index": meta.get('chunk_index', 0),
-                    "total_chunks": meta.get('total_chunks', 1),
+                    "char_count": meta.get('char_count', 0)
                 })
 
             return {"success": True, "results": processed_results, "query": query}
@@ -730,32 +522,15 @@ class RAGService:
                 upload_id=upload_id
             )
 
-            # No documents indexed at all → tell user to upload
+            # No documents indexed at all → answer from general knowledge
             if not search_results["success"]:
-                reason = search_results.get("reason", "empty_index")
-                if reason == "empty_index":
-                    return {
-                        "success": True,
-                        "answer": (
-                            "It looks like you haven't uploaded any documents yet — "
-                            "or your documents may need to be re-indexed. "
-                            "Please upload a PDF and I'll be able to give you "
-                            "precise, source-backed answers right away!"
-                        ),
-                        "sources": [],
-                        "query": query,
-                        "context_documents_used": 0,
-                        "total_context_chars": 0,
-                        "response_type": "no_documents"
-                    }
-                # reason == "no_match" → answer from general knowledge
-                return self._generate_general_response(query, hint="no_match")
+                return self._generate_general_response(query)
 
             results = search_results.get("results", [])
 
             # No matches returned
             if not results:
-                return self._generate_general_response(query, hint="no_match")
+                return self._generate_general_response(query)
 
             # ── Step 3: Check similarity threshold ────────────────────────
             # If the best match is below 0.40 the query is probably unrelated
@@ -763,7 +538,7 @@ class RAGService:
             SIMILARITY_THRESHOLD = 0.40
             max_similarity = max(r["similarity"] for r in results)
             if max_similarity < SIMILARITY_THRESHOLD:
-                return self._generate_general_response(query, hint="low_similarity")
+                return self._generate_general_response(query)
 
             # ── Step 4: Full RAG pipeline ─────────────────────────────────
             context_parts = []
@@ -808,7 +583,7 @@ class RAGService:
                 })
 
             if not context_parts:
-                return self._generate_general_response(query, hint="no_match")
+                return self._generate_general_response(query)
 
             context = "\n" + "=" * 60 + "\n".join(context_parts)
 
