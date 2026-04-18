@@ -342,6 +342,51 @@ class RAGService:
             print(f"Error indexing document: {e}")
             return {"success": False, "message": f"Error indexing document: {str(e)}"}
 
+    def _expand_query(self, query: str) -> list[str]:
+        """
+        Generate multiple semantically diverse retrieval queries from the user's
+        original question. Merging results from all variants catches intent that
+        a single embedding would miss — regardless of document type or query style.
+
+        Handles: colloquial phrasing, pronouns without context, vague follow-ups,
+        negation, short/ambiguous queries, multi-part questions, and more.
+
+        Falls back to [query] so the caller always gets at least one query.
+        """
+        try:
+            model = genai.GenerativeModel(
+                model_name='gemini-2.0-flash',
+                system_instruction=(
+                    "You are a search query expansion engine. "
+                    "Given a user question, output 3 alternative search queries that capture "
+                    "the same intent using different vocabulary, phrasing, and specificity levels. "
+                    "Rules:\n"
+                    "- Each query must be a short keyword-rich phrase (not a full sentence)\n"
+                    "- Cover the intent from different angles: broad, specific, and synonym-based\n"
+                    "- Do NOT assume the document type — queries must work for any document\n"
+                    "- If the question contains pronouns (he/she/they/it), rephrase around the topic itself\n"
+                    "- Output exactly 3 lines, one query per line, no numbering, no punctuation at end"
+                )
+            )
+            response = model.generate_content(
+                query,
+                generation_config=genai.GenerationConfig(temperature=0.3, max_output_tokens=120)
+            )
+            variants = [
+                line.strip()
+                for line in response.text.strip().splitlines()
+                if line.strip()
+            ][:3]
+
+            # Always include the original so we never lose a strong literal match
+            all_queries = [query] + [v for v in variants if v.lower() != query.lower()]
+            print(f"Query expansion: {all_queries}")
+            return all_queries
+
+        except Exception as e:
+            print(f"Query expansion failed, using original: {e}")
+            return [query]
+
     def search(
         self,
         user_id: str,
@@ -352,23 +397,36 @@ class RAGService:
         try:
             index = self._ensure_user_index(user_id)
             namespace = self._get_user_namespace(user_id)
-            query_embedding = self._generate_query_embedding(query).tolist()
-
             filter_dict = {"upload_id": upload_id} if upload_id else None
 
-            results = index.query(
-                vector=query_embedding,
-                top_k=top_k,
-                include_metadata=True,
-                namespace=namespace,
-                filter=filter_dict,
-            )
+            # Expand the query into multiple variants and embed each one.
+            # Merge by keeping the highest score per vector ID so duplicates
+            # don't inflate results and the best signal always wins.
+            queries = self._expand_query(query)
+            best_by_id: dict = {}
 
-            if not results.matches:
+            for q in queries:
+                embedding = self._generate_query_embedding(q).tolist()
+                res = index.query(
+                    vector=embedding,
+                    top_k=top_k,
+                    include_metadata=True,
+                    namespace=namespace,
+                    filter=filter_dict,
+                )
+                for match in res.matches:
+                    existing = best_by_id.get(match.id)
+                    if existing is None or match.score > existing.score:
+                        best_by_id[match.id] = match
+
+            # Sort merged matches by score descending, cap at top_k
+            merged = sorted(best_by_id.values(), key=lambda m: m.score, reverse=True)[:top_k]
+
+            if not merged:
                 return {"success": False, "message": "No indexed documents available"}
 
             processed = []
-            for match in results.matches:
+            for match in merged:
                 meta = match.metadata
                 processed.append({
                     "section_number": meta["section_number"],
@@ -525,22 +583,22 @@ class RAGService:
 
             print(f"Context: {total_context_chars:,} chars from {len(sources)} sections")
 
-            system_prompt = """You are Acumen, a highly knowledgeable AI assistant that provides accurate, detailed answers based on PDF documents.
+            system_prompt = """You are Acumen, a highly knowledgeable AI assistant that answers questions based on the user's uploaded PDF documents.
 
 CRITICAL FORMATTING RULES:
 - Write in natural, flowing paragraphs
 - Use **bold** ONLY to emphasise key terms or names within sentences
 - NEVER use bullet points, dashes, or numbered lists unless explicitly asked
-- Write conversationally, as if explaining to a colleague
+- Write conversationally, like a knowledgeable friend explaining something — not like a report
 
 ANSWERING GUIDELINES:
-- Use ALL relevant information from the documents
-- Reference documents naturally: "According to Document 1..." or "Document 2 explains..."
-- Quote important statements using quotation marks when appropriate
-- Synthesise information across multiple documents
-- Stay factual and cite specific document sections
+- Synthesise information naturally into your answer — do NOT reference "Document 1", "Document 2", or any numbered document labels
+- If you need to attribute something to a source, mention the filename or document title naturally (e.g. "In Oseghale's CV..." or "The report mentions...")
+- Quote important phrases using quotation marks when it adds value
+- Stay factual and grounded in the provided content
+- Give complete, detailed answers — do not truncate or summarise unnecessarily
 
-Remember: Natural prose, detailed explanations, proper citations."""
+Remember: Sound like a person who has read the documents, not a system citing its sources."""
 
             user_prompt = (
                 f"Answer my question using the document excerpts below.\n\n"
