@@ -220,23 +220,6 @@ def upload_text_to_cloudinary(sections_data: list, user_id: str, upload_id: str)
     }
 
 
-def upload_pdf_to_cloudinary(pdf_path: str, user_id: str, upload_id: str, filename: str) -> dict:
-    """Upload the original PDF to Cloudinary as a backup and for re-processing."""
-    result = cloudinary.uploader.upload(
-        pdf_path,
-        resource_type="raw",
-        folder=f"acumen/{user_id}/pdfs",
-        public_id=upload_id,
-        display_name=filename,
-        overwrite=True,
-    )
-    return {
-        "url": result["secure_url"],
-        "public_id": result["public_id"],
-        "bytes": result.get("bytes", 0),
-    }
-
-
 def delete_cloudinary_resources(public_ids: list) -> None:
     """Delete Cloudinary resources by public_id (best-effort, non-fatal)."""
     for pid in public_ids:
@@ -365,8 +348,7 @@ def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str) -> d
     Core processing pipeline:
       1. Extract text sections from the PDF
       2. Upload sections JSON to Cloudinary  (text storage — keeps MongoDB lean)
-      3. Upload original PDF to Cloudinary   (backup / re-processing)
-      4. Save lightweight metadata to MongoDB  (NO text_content field)
+      3. Save lightweight metadata to MongoDB  (NO text_content field)
     """
     doc = fitz.open(pdf_path)
     print(f"\nProcessing: {filename} ({len(doc)} pages)")
@@ -381,10 +363,6 @@ def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str) -> d
     print("Uploading extracted text to Cloudinary...")
     text_cl = upload_text_to_cloudinary(sections_data, user_id, upload_id)
     print(f"Text uploaded ({text_cl['bytes']:,} bytes): {text_cl['url']}")
-
-    print("Uploading original PDF to Cloudinary...")
-    pdf_cl = upload_pdf_to_cloudinary(pdf_path, user_id, upload_id, filename)
-    print(f"PDF uploaded ({pdf_cl['bytes']:,} bytes): {pdf_cl['url']}")
 
     # MongoDB records — metadata only, no text_content
     records = []
@@ -405,11 +383,9 @@ def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str) -> d
                 "title": metadata.get("title", ""),
                 "subject": metadata.get("subject", ""),
             },
-            # Cloudinary references (same for all sections of this upload)
+            # Cloudinary text reference (same for all sections of this upload)
             "text_cloudinary_url": text_cl["url"],
             "text_cloudinary_public_id": text_cl["public_id"],
-            "pdf_cloudinary_url": pdf_cl["url"],
-            "pdf_cloudinary_public_id": pdf_cl["public_id"],
             "uploaded_at": datetime.utcnow(),
         })
 
@@ -423,7 +399,6 @@ def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str) -> d
         "total_pages": total_pages,
         "total_characters": sum(s["char_count"] for s in sections_data),
         "text_cloudinary_url": text_cl["url"],
-        "pdf_cloudinary_url": pdf_cl["url"],
         "message": "PDF processed successfully",
     }
 
@@ -435,7 +410,7 @@ async def root():
     return {
         "message": "ACUMEN PDF API",
         "version": "5.0",
-        "storage": "MongoDB (metadata) + Cloudinary (text + PDFs) + Pinecone (vectors)",
+        "storage": "MongoDB (metadata) + Cloudinary (text) + Pinecone (vectors)",
     }
 
 
@@ -538,7 +513,6 @@ async def get_my_documents(current_user: dict = Depends(get_current_user)):
                 "total_pages": {"$first": "$total_pages"},
                 "total_characters": {"$sum": "$char_count"},
                 "pdf_title": {"$first": "$pdf_metadata.title"},
-                "pdf_cloudinary_url": {"$first": "$pdf_cloudinary_url"},
                 "text_cloudinary_url": {"$first": "$text_cloudinary_url"},
             }},
             {"$sort": {"uploaded_at": -1}},
@@ -567,7 +541,6 @@ async def get_document_details(upload_id: str, current_user: dict = Depends(get_
             "filename": sections[0]["filename"],
             "total_sections": len(sections),
             "total_characters": sum(s.get("char_count", 0) for s in sections),
-            "pdf_cloudinary_url": sections[0].get("pdf_cloudinary_url"),
             "text_cloudinary_url": sections[0].get("text_cloudinary_url"),
             "sections": sections,
         }
@@ -582,7 +555,7 @@ async def delete_document(upload_id: str, current_user: dict = Depends(get_curre
     try:
         sample = documents_collection.find_one(
             {"user_id": current_user["user_id"], "upload_id": upload_id},
-            {"text_cloudinary_public_id": 1, "pdf_cloudinary_public_id": 1}
+            {"text_cloudinary_public_id": 1}
         )
         if not sample:
             raise HTTPException(status_code=404, detail="Document not found")
@@ -590,7 +563,6 @@ async def delete_document(upload_id: str, current_user: dict = Depends(get_curre
         delete_cloudinary_resources([
             pid for pid in [
                 sample.get("text_cloudinary_public_id"),
-                sample.get("pdf_cloudinary_public_id"),
             ] if pid
         ])
 

@@ -90,32 +90,43 @@ class RAGService:
 
     # ── Pinecone helpers ─────────────────────────────────────────────────────
 
-    def _get_user_index_name(self, user_id: str) -> str:
+    # ── Single shared index — users are isolated by namespace ───────────────
+    SHARED_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "acumen-documents")
+
+    def _get_user_namespace(self, user_id: str) -> str:
+        """Each user gets their own namespace inside the shared index."""
         return f"user-{hashlib.md5(user_id.encode()).hexdigest()}"
 
     def _ensure_user_index(self, user_id: str):
-        index_name = self._get_user_index_name(user_id)
+        """
+        Return the single shared Pinecone index, creating it once if needed.
+        Pass _get_user_namespace(user_id) as the `namespace` on every operation.
+        """
         existing = self.pc.list_indexes().names()
 
-        if index_name in existing:
-            try:
-                desc = self.pc.describe_index(index_name)
-                if desc.dimension != self.embedding_dimension:
-                    print(f"Index dimension mismatch ({desc.dimension} vs {self.embedding_dimension}). Recreating...")
-                    self.pc.delete_index(index_name)
-                    existing = []
-            except Exception as e:
-                print(f"Index check warning: {e}")
-
-        if index_name not in existing:
+        if self.SHARED_INDEX_NAME not in existing:
+            print(f"Creating shared Pinecone index '{self.SHARED_INDEX_NAME}' ...")
             self.pc.create_index(
-                name=index_name,
+                name=self.SHARED_INDEX_NAME,
                 dimension=self.embedding_dimension,
                 metric="cosine",
                 spec=ServerlessSpec(cloud="aws", region="us-east-1"),
             )
+        else:
+            try:
+                desc = self.pc.describe_index(self.SHARED_INDEX_NAME)
+                if desc.dimension != self.embedding_dimension:
+                    raise ValueError(
+                        f"Existing index dimension {desc.dimension} != expected "
+                        f"{self.embedding_dimension}. Delete '{self.SHARED_INDEX_NAME}' "
+                        "manually or set a new PINECONE_INDEX_NAME env var."
+                    )
+            except ValueError:
+                raise
+            except Exception as e:
+                print(f"Index check warning: {e}")
 
-        return self.pc.Index(index_name)
+        return self.pc.Index(self.SHARED_INDEX_NAME)
 
     # ── Embedding generation ─────────────────────────────────────────────────
 
@@ -267,6 +278,7 @@ class RAGService:
 
             print(f"\nIndexing {len(sections)} sections for upload_id: {upload_id}")
             index = self._ensure_user_index(user_id)
+            namespace = self._get_user_namespace(user_id)
 
             vectors = []
             total_chars = 0
@@ -315,7 +327,7 @@ class RAGService:
                 print(f"  ✓ Section {section_number}: {len(text):,} chars")
 
             if vectors:
-                index.upsert(vectors=vectors, namespace="")
+                index.upsert(vectors=vectors, namespace=namespace)
                 print(f"✓ Indexed {len(vectors)} sections ({total_chars:,} chars)")
 
             return {
@@ -339,6 +351,7 @@ class RAGService:
     ) -> dict:
         try:
             index = self._ensure_user_index(user_id)
+            namespace = self._get_user_namespace(user_id)
             query_embedding = self._generate_query_embedding(query).tolist()
 
             filter_dict = {"upload_id": upload_id} if upload_id else None
@@ -347,7 +360,7 @@ class RAGService:
                 vector=query_embedding,
                 top_k=top_k,
                 include_metadata=True,
-                namespace="",
+                namespace=namespace,
                 filter=filter_dict,
             )
 
@@ -379,24 +392,26 @@ class RAGService:
     def delete_document_vectors(self, user_id: str, upload_id: str) -> dict:
         try:
             index = self._ensure_user_index(user_id)
+            namespace = self._get_user_namespace(user_id)
             results = index.query(
                 vector=[0.0] * self.embedding_dimension,
                 top_k=10000,
                 filter={"upload_id": upload_id},
-                namespace="",
+                namespace=namespace,
             )
             ids = [m.id for m in results.matches]
             if ids:
-                index.delete(ids=ids, namespace="")
+                index.delete(ids=ids, namespace=namespace)
             return {"success": True, "deleted_count": len(ids)}
         except Exception as e:
             return {"success": False, "message": f"Delete error: {str(e)}"}
 
     def delete_user_vectors(self, user_id: str) -> dict:
         try:
-            name = self._get_user_index_name(user_id)
-            if name in self.pc.list_indexes().names():
-                self.pc.delete_index(name)
+            index = self._ensure_user_index(user_id)
+            namespace = self._get_user_namespace(user_id)
+            # Delete all vectors in this user's namespace (not the whole index)
+            index.delete(delete_all=True, namespace=namespace)
             return {"success": True, "message": "Deleted all vectors for user"}
         except Exception as e:
             return {"success": False, "message": f"Delete error: {str(e)}"}
@@ -404,7 +419,11 @@ class RAGService:
     def get_user_stats(self, user_id: str) -> dict:
         try:
             index = self._ensure_user_index(user_id)
+            namespace = self._get_user_namespace(user_id)
             stats = index.describe_index_stats()
+            # Vector count scoped to this user's namespace
+            ns_stats = stats.get("namespaces", {}).get(namespace, {})
+            total_vectors = ns_stats.get("vector_count", 0)
             uploads = list(self.documents_collection.aggregate([
                 {"$match": {"user_id": user_id}},
                 {"$group": {
@@ -416,7 +435,7 @@ class RAGService:
             ]))
             return {
                 "success": True,
-                "total_indexed_sections": stats["total_vector_count"],
+                "total_indexed_sections": total_vectors,
                 "total_documents": len(uploads),
                 "documents": uploads,
             }
