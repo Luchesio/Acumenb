@@ -23,6 +23,10 @@ from bson import ObjectId
 import cloudinary
 import cloudinary.uploader
 
+# ─── Google Auth ──────────────────────────────────────────────────────────────
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
+
 # Load environment variables
 load_dotenv()
 
@@ -52,14 +56,14 @@ if not JWT_SECRET_KEY:
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 30
 
+# ─── Google OAuth configuration ───────────────────────────────────────────────
+# Add to your .env file:
+#   GOOGLE_CLIENT_ID=your_google_client_id.apps.googleusercontent.com
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+if not GOOGLE_CLIENT_ID:
+    print("WARNING: GOOGLE_CLIENT_ID not set. Google Sign-In will be disabled.")
+
 # ─── Cloudinary configuration ─────────────────────────────────────────────────
-# Add these three lines to your .env file — get the values from
-# cloudinary.com/console → Settings → Access Keys:
-#
-#   CLOUDINARY_CLOUD_NAME=your_cloud_name
-#   CLOUDINARY_API_KEY=your_api_key
-#   CLOUDINARY_API_SECRET=your_api_secret
-#
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
     api_key=os.getenv("CLOUDINARY_API_KEY"),
@@ -132,6 +136,11 @@ class LoginRequest(BaseModel):
         return v.strip().lower()
 
 
+class GoogleAuthRequest(BaseModel):
+    """Receives the credential (ID token) issued by Google Identity Services."""
+    credential: str
+
+
 # ─── Password helpers ─────────────────────────────────────────────────────────
 
 def hash_password(password: str) -> str:
@@ -189,13 +198,6 @@ async def get_current_user(
 # ─── Cloudinary helpers ───────────────────────────────────────────────────────
 
 def upload_text_to_cloudinary(sections_data: list, user_id: str, upload_id: str) -> dict:
-    """
-    Serialise extracted text sections to JSON and store them in Cloudinary.
-
-    This keeps MongoDB documents tiny (metadata only, ~1KB each) while
-    the actual text content (potentially hundreds of KB per document) lives
-    in Cloudinary's cheap object storage.
-    """
     payload = json.dumps({
         "upload_id": upload_id,
         "user_id": user_id,
@@ -226,7 +228,6 @@ def upload_text_to_cloudinary(sections_data: list, user_id: str, upload_id: str)
 
 
 def delete_cloudinary_resources(public_ids: list) -> None:
-    """Delete Cloudinary resources by public_id (best-effort, non-fatal)."""
     for pid in public_ids:
         try:
             cloudinary.uploader.destroy(pid, resource_type="raw")
@@ -235,7 +236,6 @@ def delete_cloudinary_resources(public_ids: list) -> None:
 
 
 def fetch_sections_from_cloudinary(text_url: str) -> list:
-    """Fetch and parse the sections JSON stored in Cloudinary."""
     try:
         resp = requests.get(text_url, timeout=15)
         resp.raise_for_status()
@@ -349,12 +349,6 @@ def extract_sections_advanced(doc) -> list:
 
 
 def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str) -> dict:
-    """
-    Core processing pipeline:
-      1. Extract text sections from the PDF
-      2. Upload sections JSON to Cloudinary  (text storage — keeps MongoDB lean)
-      3. Save lightweight metadata to MongoDB  (NO text_content field)
-    """
     doc = fitz.open(pdf_path)
     print(f"\nProcessing: {filename} ({len(doc)} pages)")
     sections_data = extract_sections_advanced(doc)
@@ -369,7 +363,6 @@ def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str) -> d
     text_cl = upload_text_to_cloudinary(sections_data, user_id, upload_id)
     print(f"Text uploaded ({text_cl['bytes']:,} bytes): {text_cl['url']}")
 
-    # MongoDB records — metadata only, no text_content
     records = []
     for idx, section in enumerate(sections_data):
         records.append({
@@ -379,7 +372,7 @@ def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str) -> d
             "section_number": idx + 1,
             "section_title": section["section_title"],
             "section_type": section["section_type"],
-            "char_count": section["char_count"],       # size indicator, not the text itself
+            "char_count": section["char_count"],
             "start_page": section["start_page"],
             "end_page": section["end_page"],
             "total_pages": total_pages,
@@ -388,7 +381,6 @@ def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str) -> d
                 "title": metadata.get("title", ""),
                 "subject": metadata.get("subject", ""),
             },
-            # Cloudinary text reference (same for all sections of this upload)
             "text_cloudinary_url": text_cl["url"],
             "text_cloudinary_public_id": text_cl["public_id"],
             "uploaded_at": datetime.utcnow(),
@@ -414,7 +406,7 @@ def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str) -> d
 async def root():
     return {
         "message": "ACUMEN PDF API",
-        "version": "5.0",
+        "version": "5.1",
         "storage": "MongoDB (metadata) + Cloudinary (text) + Pinecone (vectors)",
     }
 
@@ -429,6 +421,7 @@ async def register_user(request: RegisterRequest):
         users_collection.insert_one({
             "user_id": user_id, "email": request.email, "name": request.name,
             "password_hash": hash_password(request.password),
+            "auth_provider": "email",
             "created_at": datetime.utcnow(), "last_login": datetime.utcnow(),
         })
         return {"success": True, "user_token": token, "user_id": user_id,
@@ -444,12 +437,102 @@ async def register_user(request: RegisterRequest):
 async def login_user(request: LoginRequest):
     try:
         user = users_collection.find_one({"email": request.email})
-        if not user or not verify_password(request.password, user["password_hash"], request.email):
+        if not user:
             raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+        # Block password login for Google-only accounts
+        if user.get("auth_provider") == "google" and not user.get("password_hash"):
+            raise HTTPException(
+                status_code=400,
+                detail="This account uses Google Sign-In. Please use the 'Continue with Google' button."
+            )
+
+        if not verify_password(request.password, user["password_hash"], request.email):
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+
         token = create_access_token(user_id=user["user_id"], email=user["email"])
         users_collection.update_one({"email": request.email}, {"$set": {"last_login": datetime.utcnow()}})
         return {"success": True, "user_token": token, "user_id": user["user_id"],
                 "name": user["name"], "email": user["email"], "message": "Login successful."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/auth/google")
+async def google_auth(request: GoogleAuthRequest):
+    """
+    Verify a Google ID token issued by Google Identity Services (GIS).
+    Creates a new user if one does not exist, otherwise logs in the existing user.
+    Returns the same JWT structure as /login and /register.
+    """
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=503,
+            detail="Google Sign-In is not configured on this server."
+        )
+
+    try:
+        # Verify the credential with Google's public keys
+        idinfo = google_id_token.verify_oauth2_token(
+            request.credential,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
+
+    email = idinfo.get("email", "").strip().lower()
+    google_sub = idinfo.get("sub")  # Unique Google user ID
+    google_name = idinfo.get("name") or email.split("@")[0]
+    email_verified = idinfo.get("email_verified", False)
+
+    if not email or not google_sub:
+        raise HTTPException(status_code=401, detail="Google token is missing required fields.")
+
+    if not email_verified:
+        raise HTTPException(status_code=400, detail="Google account email is not verified.")
+
+    try:
+        existing_user = users_collection.find_one({"email": email})
+
+        if existing_user:
+            # User already exists — update last_login and link google_id if not set
+            update_fields: dict = {"last_login": datetime.utcnow()}
+            if not existing_user.get("google_id"):
+                update_fields["google_id"] = google_sub
+            users_collection.update_one({"email": email}, {"$set": update_fields})
+
+            user_id = existing_user["user_id"]
+            display_name = existing_user["name"]
+            message = "Signed in with Google successfully."
+        else:
+            # New user — create account (no password)
+            user_id = secrets.token_urlsafe(16)
+            display_name = google_name
+            users_collection.insert_one({
+                "user_id": user_id,
+                "email": email,
+                "name": display_name,
+                "google_id": google_sub,
+                "password_hash": None,
+                "auth_provider": "google",
+                "created_at": datetime.utcnow(),
+                "last_login": datetime.utcnow(),
+            })
+            message = "Account created with Google. Welcome to Acumen!"
+
+        token = create_access_token(user_id=user_id, email=email)
+        return {
+            "success": True,
+            "user_token": token,
+            "user_id": user_id,
+            "name": display_name,
+            "email": email,
+            "message": message,
+        }
+
     except HTTPException:
         raise
     except Exception as e:
@@ -658,7 +741,6 @@ async def get_rag_stats(current_user: dict = Depends(get_current_user)):
 
 @app.post("/reindex-document/{upload_id}")
 async def reindex_document(upload_id: str, current_user: dict = Depends(get_current_user)):
-    """Re-index a single document. Call this if ACUMEN can't find an uploaded document."""
     try:
         doc = documents_collection.find_one(
             {"user_id": current_user["user_id"], "upload_id": upload_id},
@@ -679,7 +761,6 @@ async def reindex_document(upload_id: str, current_user: dict = Depends(get_curr
 
 @app.post("/reindex-all")
 async def reindex_all_documents(current_user: dict = Depends(get_current_user)):
-    """Re-index all documents. Run this once after deploying the Cloudinary migration."""
     try:
         docs = list(documents_collection.aggregate([
             {"$match": {"user_id": current_user["user_id"]}},
@@ -711,8 +792,6 @@ async def reindex_all_documents(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
-
 # ─── Voice endpoints ──────────────────────────────────────────────────────────
 
 class SpeakRequest(BaseModel):
@@ -724,21 +803,12 @@ async def transcribe_audio(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Speech-to-Text: receive an audio blob from the browser's MediaRecorder,
-    pass it inline to Gemini, and return the transcribed text.
-
-    Accepts: audio/webm (Chrome), audio/ogg (Firefox), audio/mp4, audio/wav
-    Returns: { "text": "transcribed words" }
-    """
     try:
         audio_bytes = await file.read()
         if not audio_bytes:
             raise HTTPException(status_code=400, detail="Empty audio file received.")
 
-        # Honour the MIME type reported by the browser; fall back to webm
         mime_type = file.content_type or "audio/webm"
-        # Normalise — some browsers send 'audio/webm;codecs=opus'
         mime_type = mime_type.split(";")[0].strip()
 
         text = voice_service.transcribe(audio_bytes, mime_type=mime_type)
@@ -755,12 +825,6 @@ async def speak_text(
     request: SpeakRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Text-to-Speech: convert Acumen's response text to speech and return
-    a WAV audio file that the browser can play directly.
-
-    Returns: audio/wav binary
-    """
     try:
         if not request.text or not request.text.strip():
             raise HTTPException(status_code=400, detail="No text provided.")

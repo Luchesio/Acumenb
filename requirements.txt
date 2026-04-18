@@ -16,3 +16,4 @@ python-jose[cryptography]
 email-validator
 cloudinary
 requests
+google-auth
