@@ -5,6 +5,7 @@ import os
 import requests
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
@@ -14,6 +15,7 @@ import secrets
 import hashlib
 import ssl
 from rag_service import get_rag_service
+from voice_service import get_voice_service
 import bcrypt
 from jose import JWTError, jwt
 from pydantic import BaseModel, field_validator
@@ -76,6 +78,9 @@ documents_collection = db[DOCUMENTS_COLLECTION]
 
 # ─── RAG Service ──────────────────────────────────────────────────────────────
 rag_service = get_rag_service()
+
+# ─── Voice Service ────────────────────────────────────────────────────────────
+voice_service = get_voice_service()
 
 # MongoDB indexes
 users_collection.create_index("email", unique=True)
@@ -704,6 +709,73 @@ async def reindex_all_documents(current_user: dict = Depends(get_current_user)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+# ─── Voice endpoints ──────────────────────────────────────────────────────────
+
+class SpeakRequest(BaseModel):
+    text: str
+
+
+@app.post("/transcribe")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Speech-to-Text: receive an audio blob from the browser's MediaRecorder,
+    pass it inline to Gemini, and return the transcribed text.
+
+    Accepts: audio/webm (Chrome), audio/ogg (Firefox), audio/mp4, audio/wav
+    Returns: { "text": "transcribed words" }
+    """
+    try:
+        audio_bytes = await file.read()
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="Empty audio file received.")
+
+        # Honour the MIME type reported by the browser; fall back to webm
+        mime_type = file.content_type or "audio/webm"
+        # Normalise — some browsers send 'audio/webm;codecs=opus'
+        mime_type = mime_type.split(";")[0].strip()
+
+        text = voice_service.transcribe(audio_bytes, mime_type=mime_type)
+        return {"success": True, "text": text}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+
+
+@app.post("/speak")
+async def speak_text(
+    request: SpeakRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Text-to-Speech: convert Acumen's response text to speech and return
+    a WAV audio file that the browser can play directly.
+
+    Returns: audio/wav binary
+    """
+    try:
+        if not request.text or not request.text.strip():
+            raise HTTPException(status_code=400, detail="No text provided.")
+
+        wav_bytes = voice_service.synthesize(request.text)
+        return Response(
+            content=wav_bytes,
+            media_type="audio/wav",
+            headers={"Content-Disposition": "inline; filename=acumen-response.wav"},
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Speech synthesis failed: {str(e)}")
 
 
 if __name__ == "__main__":

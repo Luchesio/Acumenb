@@ -7,6 +7,7 @@ pandas
 python-multipart
 faiss-cpu
 google-generativeai
+google-genai
 numpy
 pinecone
 pdfplumber
