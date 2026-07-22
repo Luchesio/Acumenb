@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import requests
 from typing import List, Dict, Any, Optional
@@ -17,12 +18,15 @@ load_dotenv()
 
 class RAGService:
     """
-    RAG Service using Pinecone (vectors) + Cloudinary (text) + Gemini (LLM).
+    RAG Service using Pinecone (vectors) + Cloudinary (chunk text) + Gemini (LLM).
 
-    Text content is no longer read from MongoDB — it is fetched from the
-    Cloudinary URL stored in the Pinecone vector metadata. This keeps MongoDB
-    documents lightweight (metadata only) while text lives in Cloudinary.
+    Documents are stored as overlapping character chunks produced by
+    RecursiveCharacterTextSplitter. Each chunk becomes one vector, and the chunk
+    text is carried in Pinecone metadata so answers can be built without a
+    round-trip to Cloudinary (which is still used as the fallback source).
     """
+
+    SHARED_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "acumen-documents")
 
     def __init__(self):
         self.mongo_uri = os.getenv("MONGO_URI")
@@ -42,6 +46,8 @@ class RAGService:
 
         self.embedding_model_name = "models/gemini-embedding-001"
         self.embedding_dimension = 3072
+        self.embed_batch_size = int(os.getenv("EMBED_BATCH_SIZE", "32"))
+        self.upsert_batch_size = int(os.getenv("UPSERT_BATCH_SIZE", "50"))
 
         self.pinecone_api_key = os.getenv("PINECONE_API_KEY")
         if not self.pinecone_api_key:
@@ -49,59 +55,49 @@ class RAGService:
         self.pc = Pinecone(api_key=self.pinecone_api_key)
 
         self.max_context_chars = 80000
+        self.max_metadata_chars = 8000
+        self.max_history_turns = int(os.getenv("MAX_HISTORY_TURNS", "6"))
 
-        # Similarity threshold — lower = more permissive (catches more docs),
-        # higher = stricter (fewer false positives). Tunable via env var.
         self.SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.25"))
         print(f"RAG similarity threshold: {self.SIMILARITY_THRESHOLD}")
 
-        self._greeting_tokens = {
-            'hi', 'hello', 'hey', 'howdy', 'hiya', 'yo', 'sup', 'greetings',
-            'good morning', 'good afternoon', 'good evening', 'good night',
-            'how are you', "how's it going", "what's up", 'whats up',
-            "how's everything", 'nice to meet you', 'pleased to meet you',
-        }
-        self._polite_closers = {
-            'thanks', 'thank you', 'thank you so much', 'ok', 'okay',
-            'cool', 'great', 'awesome', 'perfect', 'sounds good', 'got it',
-            'understood', 'alright', 'sure', 'bye', 'goodbye', 'see you',
-            'cheers', 'much appreciated',
-        }
+    # ── Cloudinary ───────────────────────────────────────────────────────────
 
-    # ── Cloudinary text fetch ────────────────────────────────────────────────
-
-    def _fetch_sections_from_cloudinary(self, url: str) -> list:
-        """Fetch the sections JSON uploaded by main.py and return the list."""
+    def _fetch_chunks_from_cloudinary(self, url: str) -> list:
+        """Returns a normalised chunk list. Supports the legacy 'sections' payload."""
         try:
             resp = requests.get(url, timeout=15)
             resp.raise_for_status()
-            return resp.json().get("sections", [])
+            data = resp.json()
         except Exception as e:
-            print(f"Failed to fetch sections from Cloudinary: {e}")
+            print(f"Failed to fetch chunks from Cloudinary: {e}")
             return []
 
-    def _get_section_text(self, section_number: int, cloudinary_text_url: str) -> str:
-        """Fetch all sections and return the text for the specific section_number."""
-        sections = self._fetch_sections_from_cloudinary(cloudinary_text_url)
-        for s in sections:
-            if s.get("section_number") == section_number or sections.index(s) + 1 == section_number:
-                return s.get("text_content", "")
-        return ""
+        if data.get("chunks"):
+            return data["chunks"]
+
+        legacy = data.get("sections", [])
+        return [
+            {
+                "chunk_index": i + 1,
+                "text": s.get("text_content", ""),
+                "chunk_title": s.get("section_title", f"Section {i + 1}"),
+                "start_page": s.get("start_page", 1),
+                "end_page": s.get("end_page", 1),
+                "char_count": s.get("char_count", len(s.get("text_content", ""))),
+            }
+            for i, s in enumerate(legacy)
+        ]
 
     # ── Pinecone helpers ─────────────────────────────────────────────────────
 
-    # ── Single shared index — users are isolated by namespace ───────────────
-    SHARED_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "acumen-documents")
-
     def _get_user_namespace(self, user_id: str) -> str:
-        """Each user gets their own namespace inside the shared index."""
         return f"user-{hashlib.md5(user_id.encode()).hexdigest()}"
 
+    def _vector_id(self, upload_id: str, chunk_index: int) -> str:
+        return f"{upload_id}#{chunk_index}"
+
     def _ensure_user_index(self, user_id: str):
-        """
-        Return the single shared Pinecone index, creating it once if needed.
-        Pass _get_user_namespace(user_id) as the `namespace` on every operation.
-        """
         existing = self.pc.list_indexes().names()
 
         if self.SHARED_INDEX_NAME not in existing:
@@ -128,18 +124,29 @@ class RAGService:
 
         return self.pc.Index(self.SHARED_INDEX_NAME)
 
-    # ── Embedding generation ─────────────────────────────────────────────────
+    # ── Embeddings ───────────────────────────────────────────────────────────
 
-    def _generate_embedding(self, text: str) -> np.ndarray:
-        if len(text) > 10000:
-            parts = [text[:3000], text[len(text)//2-1500:len(text)//2+1500], text[-3000:]]
-            text = "\n...\n".join(parts)
-        result = genai.embed_content(
-            model=self.embedding_model_name,
-            content=text,
-            task_type="retrieval_document",
-        )
-        return np.array(result['embedding'], dtype='float32')
+    def _embed_texts(self, texts: List[str], task_type: str = "retrieval_document") -> List[list]:
+        embeddings: List[list] = []
+        for i in range(0, len(texts), self.embed_batch_size):
+            batch = texts[i:i + self.embed_batch_size]
+            try:
+                result = genai.embed_content(
+                    model=self.embedding_model_name,
+                    content=batch,
+                    task_type=task_type,
+                )
+                embeddings.extend(result["embedding"])
+            except Exception as e:
+                print(f"Batch embedding failed ({e}) — falling back to single requests")
+                for text in batch:
+                    single = genai.embed_content(
+                        model=self.embedding_model_name,
+                        content=text,
+                        task_type=task_type,
+                    )
+                    embeddings.append(single["embedding"])
+        return embeddings
 
     def _generate_query_embedding(self, query: str) -> np.ndarray:
         result = genai.embed_content(
@@ -149,21 +156,18 @@ class RAGService:
         )
         return np.array(result['embedding'], dtype='float32')
 
-    def _create_indexable_text(self, section: dict) -> str:
-        """Build the text string that gets embedded for a section."""
+    def _create_indexable_text(self, chunk: dict, doc_meta: dict) -> str:
         parts = []
-        if section.get("pdf_metadata", {}).get("title"):
-            parts.append(f"Document: {section['pdf_metadata']['title']}")
-        if section.get("section_title"):
-            parts.append(f"Section: {section['section_title']}")
-        if section.get("pdf_metadata", {}).get("author"):
-            parts.append(f"Author: {section['pdf_metadata']['author']}")
-        if section.get("text_content"):
-            parts.append(f"\nContent:\n{section['text_content']}")
+        if doc_meta.get("filename"):
+            parts.append(f"Document: {doc_meta['filename']}")
+        if doc_meta.get("pdf_metadata", {}).get("title"):
+            parts.append(f"Title: {doc_meta['pdf_metadata']['title']}")
+        if doc_meta.get("pdf_metadata", {}).get("author"):
+            parts.append(f"Author: {doc_meta['pdf_metadata']['author']}")
+        if chunk.get("chunk_title"):
+            parts.append(f"Location: {chunk['chunk_title']}")
+        parts.append(f"\n{chunk.get('text', '')}")
         return "\n".join(parts)
-
-    def _generate_document_id(self, user_id: str, upload_id: str, section_number: int) -> str:
-        return hashlib.md5(f"{user_id}_{upload_id}_{section_number}".encode()).hexdigest()
 
     def _smart_truncate(self, text: str, max_chars: int) -> str:
         if len(text) <= max_chars:
@@ -172,44 +176,30 @@ class RAGService:
         bp = max(truncated.rfind('.'), truncated.rfind('\n'))
         return truncated[:bp + 1] if bp > max_chars * 0.8 else truncated + "..."
 
-    # ── Conversational intent ────────────────────────────────────────────────
+    # ── Conversation context ─────────────────────────────────────────────────
 
-    def _is_conversational(self, query: str) -> bool:
-        q = query.strip().lower().rstrip('!.,?')
-        if q in self._greeting_tokens or q in self._polite_closers:
-            return True
-        for phrase in self._greeting_tokens:
-            if q.startswith(phrase):
-                return True
-        words = q.split()
-        if len(words) <= 4 and '?' not in query:
-            filler = {'i', 'am', 'is', 'are', 'a', 'the', 'just', 'so', 'very'}
-            if not [w for w in words if w not in filler]:
-                return True
-        return False
+    def _format_history(self, history: Optional[List[dict]]) -> str:
+        """Trim and flatten recent turns. Assistant turns are cut harder — they
+        are long, and only their gist is needed to resolve a reference."""
+        if not history:
+            return ""
 
-    def _generate_conversational_response(self, query: str) -> dict:
-        try:
-            model = genai.GenerativeModel(
-                model_name='gemini-2.0-flash',
-                system_instruction=(
-                    "You are Acumen, a friendly AI assistant on a document Q&A platform. "
-                    "Respond warmly and briefly to greetings and casual messages. "
-                    "Let users know you're here to help with their uploaded documents."
-                )
-            )
-            response = model.generate_content(
-                query,
-                generation_config=genai.GenerationConfig(temperature=0.7, max_output_tokens=300)
-            )
-            return {"success": True, "answer": response.text.strip(), "sources": [],
-                    "query": query, "context_documents_used": 0, "response_type": "conversational"}
-        except Exception:
-            return {"success": True,
-                    "answer": "Hello! I'm Acumen. Upload a PDF and ask me anything about it!",
-                    "sources": [], "query": query, "response_type": "conversational"}
+        lines = []
+        for turn in history[-self.max_history_turns:]:
+            role = "User" if str(turn.get("role", "")).strip().lower() == "user" else "Acumen"
+            content = " ".join(str(turn.get("content", "")).split())
+            if not content:
+                continue
+            limit = 1200 if role == "User" else 800
+            if len(content) > limit:
+                content = content[:limit].rstrip() + "..."
+            lines.append(f"{role}: {content}")
 
-    def _generate_general_response(self, query: str) -> dict:
+        return "\n".join(lines)
+
+    # ── Fallback when retrieval finds nothing relevant ───────────────────────
+
+    def _generate_general_response(self, query: str, history: Optional[List[dict]] = None) -> dict:
         try:
             model = genai.GenerativeModel(
                 model_name='gemini-2.0-flash',
@@ -219,8 +209,10 @@ class RAGService:
                     "and gently remind the user they can upload relevant PDFs for more precise answers."
                 )
             )
+            conversation = self._format_history(history)
+            prompt = f"Conversation so far:\n{conversation}\n\nCurrent message: {query}" if conversation else query
             response = model.generate_content(
-                query,
+                prompt,
                 generation_config=genai.GenerationConfig(temperature=0.4, max_output_tokens=1024)
             )
             return {"success": True, "answer": response.text.strip(), "sources": [],
@@ -230,7 +222,7 @@ class RAGService:
                     "answer": "I don't have uploaded documents on this topic. Upload a relevant PDF for precise answers.",
                     "sources": [], "query": query, "response_type": "general_knowledge"}
 
-    # ── Core RAG methods ─────────────────────────────────────────────────────
+    # ── Indexing ─────────────────────────────────────────────────────────────
 
     def index_document(
         self,
@@ -238,171 +230,178 @@ class RAGService:
         upload_id: str,
         text_cloudinary_url: Optional[str] = None,
     ) -> dict:
-        """
-        Index a document into Pinecone.
-
-        Text content is fetched from Cloudinary (not MongoDB).
-        The Cloudinary URL is stored in Pinecone metadata so generate_answer
-        can fetch text at query time without touching MongoDB.
-
-        If text_cloudinary_url is not provided, it is looked up from MongoDB.
-        """
         try:
-            # Resolve the Cloudinary URL if not passed directly
-            if not text_cloudinary_url:
-                sample = self.documents_collection.find_one(
-                    {"user_id": user_id, "upload_id": upload_id},
-                    {"text_cloudinary_url": 1}
-                )
-                if not sample:
-                    return {"success": False, "message": "No documents found for this upload_id"}
-                text_cloudinary_url = sample.get("text_cloudinary_url")
+            doc_meta = self.documents_collection.find_one(
+                {"user_id": user_id, "upload_id": upload_id},
+                {"filename": 1, "pdf_metadata": 1, "text_cloudinary_url": 1, "_id": 1}
+            ) or {}
 
+            if not text_cloudinary_url:
+                text_cloudinary_url = doc_meta.get("text_cloudinary_url")
             if not text_cloudinary_url:
                 return {"success": False, "message": "No Cloudinary text URL found for this document"}
 
-            # Fetch sections from Cloudinary
-            sections = self._fetch_sections_from_cloudinary(text_cloudinary_url)
-            if not sections:
-                return {"success": False, "message": "Could not fetch sections from Cloudinary"}
+            chunks = self._fetch_chunks_from_cloudinary(text_cloudinary_url)
+            chunks = [c for c in chunks if c.get("text", "").strip()]
+            if not chunks:
+                return {"success": False, "message": "Could not fetch chunks from Cloudinary"}
 
-            # Fetch MongoDB metadata (section titles, page numbers — lightweight)
-            mongo_docs = {
-                d["section_number"]: d
-                for d in self.documents_collection.find(
-                    {"user_id": user_id, "upload_id": upload_id},
-                    {"section_number": 1, "section_title": 1, "filename": 1,
-                     "pdf_metadata": 1, "start_page": 1, "end_page": 1, "_id": 1}
-                )
-            }
-
-            print(f"\nIndexing {len(sections)} sections for upload_id: {upload_id}")
             index = self._ensure_user_index(user_id)
             namespace = self._get_user_namespace(user_id)
+            self.delete_document_vectors(user_id, upload_id)
 
+            print(f"Indexing {len(chunks)} chunks for upload_id: {upload_id}")
+
+            indexable = [self._create_indexable_text(c, doc_meta) for c in chunks]
+            embeddings = self._embed_texts(indexable)
+
+            filename = doc_meta.get("filename", "")
+            pdf_meta = doc_meta.get("pdf_metadata", {}) or {}
             vectors = []
-            total_chars = 0
 
-            for idx, section in enumerate(sections):
-                section_number = idx + 1
-                text = section.get("text_content", "")
-                if not text:
-                    continue
-
-                # Enrich with MongoDB metadata for this section
-                mongo_meta = mongo_docs.get(section_number, {})
-                enriched = {
-                    **section,
-                    "pdf_metadata": mongo_meta.get("pdf_metadata", {}),
-                    "section_title": mongo_meta.get("section_title", section.get("section_title", "")),
-                }
-
-                indexable = self._create_indexable_text(enriched)
-                total_chars += len(indexable)
-                embedding = self._generate_embedding(indexable).tolist()
-                doc_id = self._generate_document_id(user_id, upload_id, section_number)
-
-                filename = mongo_meta.get("filename", "")
-                if not filename and mongo_docs:
-                    filename = next(iter(mongo_docs.values())).get("filename", "")
-
+            for chunk, embedding in zip(chunks, embeddings):
+                chunk_index = chunk.get("chunk_index", len(vectors) + 1)
                 vectors.append({
-                    "id": doc_id,
+                    "id": self._vector_id(upload_id, chunk_index),
                     "values": embedding,
                     "metadata": {
                         "upload_id": upload_id,
-                        "section_number": section_number,
+                        "chunk_index": chunk_index,
+                        "section_number": chunk_index,
+                        "section_title": chunk.get("chunk_title", f"Chunk {chunk_index}"),
                         "filename": filename,
-                        "section_title": enriched["section_title"],
-                        "original_doc_ref": str(mongo_meta.get("_id", "")),
-                        "pdf_author": enriched["pdf_metadata"].get("author", ""),
-                        "pdf_title": enriched["pdf_metadata"].get("title", ""),
-                        "pdf_subject": enriched["pdf_metadata"].get("subject", ""),
-                        "char_count": len(text),
-                        # Store the Cloudinary URL so generate_answer can fetch
-                        # text without going back to MongoDB
+                        "original_doc_ref": str(doc_meta.get("_id", "")),
+                        "pdf_author": pdf_meta.get("author", ""),
+                        "pdf_title": pdf_meta.get("title", ""),
+                        "pdf_subject": pdf_meta.get("subject", ""),
+                        "start_page": chunk.get("start_page", 1),
+                        "end_page": chunk.get("end_page", 1),
+                        "char_count": chunk.get("char_count", len(chunk["text"])),
+                        "text": chunk["text"] if len(chunk["text"]) <= self.max_metadata_chars else "",
                         "text_cloudinary_url": text_cloudinary_url,
                     }
                 })
-                print(f"  ✓ Section {section_number}: {len(text):,} chars")
 
-            if vectors:
-                index.upsert(vectors=vectors, namespace=namespace)
-                print(f"✓ Indexed {len(vectors)} sections ({total_chars:,} chars)")
+            for i in range(0, len(vectors), self.upsert_batch_size):
+                index.upsert(vectors=vectors[i:i + self.upsert_batch_size], namespace=namespace)
+
+            total_chars = sum(v["metadata"]["char_count"] for v in vectors)
+            print(f"Indexed {len(vectors)} chunks ({total_chars:,} chars)")
 
             return {
                 "success": True,
+                "indexed_chunks": len(vectors),
                 "indexed_sections": len(vectors),
                 "total_characters": total_chars,
                 "upload_id": upload_id,
-                "message": f"Successfully indexed {len(vectors)} sections",
+                "message": f"Successfully indexed {len(vectors)} chunks",
             }
 
         except Exception as e:
             print(f"Error indexing document: {e}")
             return {"success": False, "message": f"Error indexing document: {str(e)}"}
 
-    def _expand_query(self, query: str) -> list[str]:
-        """
-        Generate multiple semantically diverse retrieval queries from the user's
-        original question. Merging results from all variants catches intent that
-        a single embedding would miss — regardless of document type or query style.
+    # ── Retrieval ────────────────────────────────────────────────────────────
 
-        Handles: colloquial phrasing, pronouns without context, vague follow-ups,
-        negation, short/ambiguous queries, multi-part questions, and more.
-
-        Falls back to [query] so the caller always gets at least one query.
+    def _route_query(self, query: str, history: Optional[List[dict]] = None) -> dict:
         """
+        One model call decides whether a message needs the user's documents and,
+        when it does not, writes the reply itself. When it does, it returns the
+        retrieval variants — so routing costs nothing beyond the query expansion
+        that already ran on every question.
+
+        Recent turns are supplied so that references ("it", "the second one",
+        "ok") are resolved against what was actually said, and so that the
+        retrieval variants are self-contained.
+        """
+        fallback = {"needs_documents": True, "queries": [query], "reply": ""}
         try:
             model = genai.GenerativeModel(
                 model_name='gemini-2.0-flash',
                 system_instruction=(
-                    "You are a search query expansion engine. "
-                    "Given a user question, output 3 alternative search queries that capture "
-                    "the same intent using different vocabulary, phrasing, and specificity levels. "
-                    "Rules:\n"
-                    "- Each query must be a short keyword-rich phrase (not a full sentence)\n"
-                    "- Cover the intent from different angles: broad, specific, and synonym-based\n"
-                    "- Do NOT assume the document type — queries must work for any document\n"
-                    "- If the question contains pronouns (he/she/they/it), rephrase around the topic itself\n"
-                    "- Output exactly 3 lines, one query per line, no numbering, no punctuation at end"
+                    "You route incoming messages for Acumen, an assistant that answers "
+                    "questions about a user's uploaded PDF documents.\n\n"
+                    "Reply with JSON containing exactly these keys: needs_documents "
+                    "(boolean), queries (array of strings), reply (string).\n\n"
+                    "You may be given the recent conversation. Use it only to work out what "
+                    "the current message refers to — never to answer from it.\n\n"
+                    "Set needs_documents to false ONLY when the current message asks for no "
+                    "information at all — greetings, thanks, acknowledgements that close a "
+                    "topic, farewells, or small talk about you. In that case leave queries "
+                    "empty and write reply yourself, speaking as Acumen: warm, one or two "
+                    "sentences, in the user's own language and register. Never invent "
+                    "document contents in a reply.\n\n"
+                    "Set needs_documents to true for everything else, including general "
+                    "knowledge questions, bare topics, single words, and any short message "
+                    "that continues a line of questioning rather than closing it — an "
+                    "acknowledgement followed by a request is a request. When in doubt, "
+                    "choose true.\n\n"
+                    "When needs_documents is true, leave reply empty and fill queries with 3 "
+                    "short keyword-rich search phrases approaching the intent from different "
+                    "angles: broad, specific, and synonym-based. Each phrase must stand on "
+                    "its own with every pronoun and reference replaced by what it points to "
+                    "in the conversation, because they are matched against documents that "
+                    "have no knowledge of this chat. Never assume a document type. Do not "
+                    "write full sentences in queries."
                 )
             )
-            response = model.generate_content(
-                query,
-                generation_config=genai.GenerationConfig(temperature=0.3, max_output_tokens=120)
-            )
-            variants = [
-                line.strip()
-                for line in response.text.strip().splitlines()
-                if line.strip()
-            ][:3]
 
-            # Always include the original so we never lose a strong literal match
-            all_queries = [query] + [v for v in variants if v.lower() != query.lower()]
-            print(f"Query expansion: {all_queries}")
-            return all_queries
+            conversation = self._format_history(history)
+            prompt = (
+                f"Recent conversation:\n{conversation}\n\nCurrent message: {query}"
+                if conversation else query
+            )
+
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.GenerationConfig(
+                    temperature=0.3,
+                    max_output_tokens=400,
+                    response_mime_type="application/json",
+                )
+            )
+
+            raw = response.text.strip()
+            if raw.startswith("```"):
+                raw = raw.strip("`")
+                raw = raw[4:] if raw.lower().startswith("json") else raw
+            data = json.loads(raw.strip())
+
+            needs_documents = bool(data.get("needs_documents", True))
+            queries = [str(q).strip() for q in data.get("queries", []) if str(q).strip()]
+            reply = str(data.get("reply", "")).strip()
+
+            if not needs_documents and reply:
+                print(f"Routed as conversational: {query!r}")
+                return {"needs_documents": False, "queries": [], "reply": reply}
+
+            if not queries:
+                queries = [query.strip()]
+            elif not conversation and query.strip() not in queries:
+                queries.insert(0, query.strip())
+
+            print(f"Routed for retrieval: {queries[:4]}")
+            return {"needs_documents": True, "queries": queries[:4], "reply": ""}
 
         except Exception as e:
-            print(f"Query expansion failed, using original: {e}")
-            return [query]
+            print(f"Routing failed, falling back to retrieval: {e}")
+            return fallback
 
     def search(
         self,
         user_id: str,
         query: str,
-        top_k: int = 5,
+        top_k: int = 12,
         upload_id: Optional[str] = None,
+        queries: Optional[List[str]] = None,
     ) -> dict:
         try:
             index = self._ensure_user_index(user_id)
             namespace = self._get_user_namespace(user_id)
             filter_dict = {"upload_id": upload_id} if upload_id else None
 
-            # Expand the query into multiple variants and embed each one.
-            # Merge by keeping the highest score per vector ID so duplicates
-            # don't inflate results and the best signal always wins.
-            queries = self._expand_query(query)
+            if not queries:
+                queries = self._route_query(query).get("queries") or [query]
             best_by_id: dict = {}
 
             for q in queries:
@@ -419,9 +418,7 @@ class RAGService:
                     if existing is None or match.score > existing.score:
                         best_by_id[match.id] = match
 
-            # Sort merged matches by score descending, cap at top_k
             merged = sorted(best_by_id.values(), key=lambda m: m.score, reverse=True)[:top_k]
-
             if not merged:
                 return {"success": False, "message": "No indexed documents available"}
 
@@ -429,16 +426,19 @@ class RAGService:
             for match in merged:
                 meta = match.metadata
                 processed.append({
-                    "section_number": meta["section_number"],
-                    "section_title": meta["section_title"],
-                    "filename": meta["filename"],
-                    "upload_id": meta["upload_id"],
+                    "chunk_index": int(meta.get("chunk_index", meta.get("section_number", 0))),
+                    "section_number": int(meta.get("section_number", 0)),
+                    "section_title": meta.get("section_title", ""),
+                    "filename": meta.get("filename", ""),
+                    "upload_id": meta.get("upload_id", ""),
                     "similarity": float(match.score),
-                    "original_doc_ref": meta.get("original_doc_ref", ""),
+                    "start_page": int(meta.get("start_page", 0)),
+                    "end_page": int(meta.get("end_page", 0)),
                     "pdf_author": meta.get("pdf_author", ""),
                     "pdf_title": meta.get("pdf_title", ""),
                     "pdf_subject": meta.get("pdf_subject", ""),
-                    "char_count": meta.get("char_count", 0),
+                    "char_count": int(meta.get("char_count", 0)),
+                    "text": meta.get("text", ""),
                     "text_cloudinary_url": meta.get("text_cloudinary_url", ""),
                 })
 
@@ -447,19 +447,29 @@ class RAGService:
         except Exception as e:
             return {"success": False, "message": f"Search error: {str(e)}"}
 
+    # ── Deletion & stats ─────────────────────────────────────────────────────
+
     def delete_document_vectors(self, user_id: str, upload_id: str) -> dict:
         try:
             index = self._ensure_user_index(user_id)
             namespace = self._get_user_namespace(user_id)
-            results = index.query(
-                vector=[0.0] * self.embedding_dimension,
-                top_k=10000,
-                filter={"upload_id": upload_id},
-                namespace=namespace,
-            )
-            ids = [m.id for m in results.matches]
-            if ids:
-                index.delete(ids=ids, namespace=namespace)
+            ids = []
+
+            try:
+                for page in index.list(prefix=f"{upload_id}#", namespace=namespace):
+                    ids.extend(page if isinstance(page, list) else [page])
+            except Exception:
+                results = index.query(
+                    vector=[0.0] * self.embedding_dimension,
+                    top_k=10000,
+                    filter={"upload_id": upload_id},
+                    namespace=namespace,
+                )
+                ids = [m.id for m in results.matches]
+
+            for i in range(0, len(ids), 1000):
+                index.delete(ids=ids[i:i + 1000], namespace=namespace)
+
             return {"success": True, "deleted_count": len(ids)}
         except Exception as e:
             return {"success": False, "message": f"Delete error: {str(e)}"}
@@ -468,7 +478,6 @@ class RAGService:
         try:
             index = self._ensure_user_index(user_id)
             namespace = self._get_user_namespace(user_id)
-            # Delete all vectors in this user's namespace (not the whole index)
             index.delete(delete_all=True, namespace=namespace)
             return {"success": True, "message": "Deleted all vectors for user"}
         except Exception as e:
@@ -479,7 +488,6 @@ class RAGService:
             index = self._ensure_user_index(user_id)
             namespace = self._get_user_namespace(user_id)
             stats = index.describe_index_stats()
-            # Vector count scoped to this user's namespace
             ns_stats = stats.get("namespaces", {}).get(namespace, {})
             total_vectors = ns_stats.get("vector_count", 0)
             uploads = list(self.documents_collection.aggregate([
@@ -487,12 +495,13 @@ class RAGService:
                 {"$group": {
                     "_id": "$upload_id",
                     "filename": {"$first": "$filename"},
-                    "sections_count": {"$sum": 1},
-                    "total_chars": {"$sum": "$char_count"},
+                    "chunks_count": {"$first": "$total_chunks"},
+                    "total_chars": {"$sum": {"$ifNull": ["$total_characters", "$char_count"]}},
                 }}
             ]))
             return {
                 "success": True,
+                "total_indexed_chunks": total_vectors,
                 "total_indexed_sections": total_vectors,
                 "total_documents": len(uploads),
                 "documents": uploads,
@@ -500,88 +509,108 @@ class RAGService:
         except Exception as e:
             return {"success": False, "message": f"Stats error: {str(e)}"}
 
+    # ── Answer generation ────────────────────────────────────────────────────
+
+    def _resolve_chunk_text(self, result: dict, cache: dict) -> str:
+        if result.get("text"):
+            return result["text"]
+
+        url = result.get("text_cloudinary_url", "")
+        if not url:
+            return ""
+        if url not in cache:
+            cache[url] = self._fetch_chunks_from_cloudinary(url)
+
+        chunks = cache[url]
+        target = result.get("chunk_index") or result.get("section_number")
+        for chunk in chunks:
+            if chunk.get("chunk_index") == target:
+                return chunk.get("text", "")
+
+        idx = (target or 1) - 1
+        if 0 <= idx < len(chunks):
+            return chunks[idx].get("text", "")
+        return ""
+
     def generate_answer(
         self,
         user_id: str,
         query: str,
-        top_k: int = 5,
+        top_k: int = 12,
         upload_id: Optional[str] = None,
+        history: Optional[List[dict]] = None,
     ) -> dict:
-        """
-        Generate an answer. Text for context is fetched from Cloudinary URLs
-        stored in Pinecone metadata — MongoDB is not consulted for text content.
-        """
         try:
-            if self._is_conversational(query):
-                return self._generate_conversational_response(query)
+            route = self._route_query(query, history)
+            if not route["needs_documents"]:
+                return {
+                    "success": True,
+                    "answer": route["reply"],
+                    "sources": [],
+                    "query": query,
+                    "context_documents_used": 0,
+                    "response_type": "conversational",
+                }
 
-            search_results = self.search(user_id=user_id, query=query, top_k=top_k, upload_id=upload_id)
+            search_results = self.search(
+                user_id=user_id, query=query, top_k=top_k,
+                upload_id=upload_id, queries=route["queries"],
+            )
             if not search_results["success"]:
-                return self._generate_general_response(query)
+                return self._generate_general_response(query, history)
 
             results = search_results.get("results", [])
             if not results:
-                return self._generate_general_response(query)
+                return self._generate_general_response(query, history)
 
             max_similarity = max(r["similarity"] for r in results)
             if max_similarity < self.SIMILARITY_THRESHOLD:
-                print(f"Best similarity {max_similarity:.3f} < threshold {self.SIMILARITY_THRESHOLD} — general response")
-                return self._generate_general_response(query)
+                print(f"Best similarity {max_similarity:.3f} < threshold {self.SIMILARITY_THRESHOLD}")
+                return self._generate_general_response(query, history)
 
-            # ── Build context: fetch text from Cloudinary ──────────────────
-            # Group results by their Cloudinary URL to avoid fetching the same
-            # JSON file multiple times for documents with several matching sections.
-            cloudinary_cache: dict[str, list] = {}
+            cloudinary_cache: dict = {}
             context_parts = []
             sources = []
             total_context_chars = 0
-            max_per_section = self.max_context_chars // max(top_k, 1)
 
-            for i, result in enumerate(results, 1):
+            for result in results:
                 if result["similarity"] < self.SIMILARITY_THRESHOLD:
                     continue
 
-                cl_url = result.get("text_cloudinary_url", "")
-                section_number = result["section_number"]
-
-                if cl_url not in cloudinary_cache:
-                    cloudinary_cache[cl_url] = self._fetch_sections_from_cloudinary(cl_url)
-
-                sections_list = cloudinary_cache[cl_url]
-                # Sections are 0-indexed in the JSON list; section_number is 1-indexed
-                text_content = ""
-                if sections_list:
-                    idx = section_number - 1
-                    if 0 <= idx < len(sections_list):
-                        text_content = sections_list[idx].get("text_content", "")
-
+                text_content = self._resolve_chunk_text(result, cloudinary_cache)
                 if not text_content:
                     continue
 
-                if len(text_content) > max_per_section:
-                    text_content = self._smart_truncate(text_content, max_per_section)
+                if total_context_chars + len(text_content) > self.max_context_chars:
+                    text_content = self._smart_truncate(
+                        text_content, max(0, self.max_context_chars - total_context_chars)
+                    )
+                    if not text_content:
+                        break
 
+                location = result.get("section_title") or ""
                 context_parts.append(
-                    f"[Document {i}]\n"
                     f"Source: {result['filename']}\n"
-                    f"Section: {result['section_title']}\n"
-                    f"Similarity: {result['similarity']:.2f}\n"
+                    f"Location: {location}\n"
                     f"Content:\n{text_content}\n"
                 )
                 total_context_chars += len(text_content)
                 sources.append({
                     "filename": result["filename"],
-                    "section_title": result["section_title"],
-                    "section_number": section_number,
+                    "section_title": location,
+                    "section_number": result.get("section_number", 0),
+                    "chunk_index": result.get("chunk_index", 0),
+                    "start_page": result.get("start_page", 0),
+                    "end_page": result.get("end_page", 0),
                     "upload_id": result["upload_id"],
                     "similarity": result["similarity"],
                     "chars_used": len(text_content),
                 })
 
             if not context_parts:
-                return self._generate_general_response(query)
+                return self._generate_general_response(query, history)
 
-            print(f"Context: {total_context_chars:,} chars from {len(sources)} sections")
+            print(f"Context: {total_context_chars:,} chars from {len(sources)} chunks")
 
             system_prompt = """You are Acumen, a highly knowledgeable AI assistant that answers questions based on the user's uploaded PDF documents.
 
@@ -592,15 +621,19 @@ CRITICAL FORMATTING RULES:
 - Write conversationally, like a knowledgeable friend explaining something — not like a report
 
 ANSWERING GUIDELINES:
-- Synthesise information naturally into your answer — do NOT reference "Document 1", "Document 2", or any numbered document labels
-- If you need to attribute something to a source, mention the filename or document title naturally (e.g. "In Oseghale's CV..." or "The report mentions...")
+- The excerpts are overlapping passages from the same documents, so ignore repetition and merge them into one coherent answer
+- Do NOT reference excerpt numbers, chunk indexes or page markers unless the user asks where something came from
+- If you need to attribute something, mention the filename or document title naturally
 - Quote important phrases using quotation marks when it adds value
 - Stay factual and grounded in the provided content
 - Give complete, detailed answers — do not truncate or summarise unnecessarily
+- When earlier turns are provided, treat the question as a continuation: resolve what it refers to, keep your wording consistent with what you already said, and do not repeat an explanation the user has just been given
 
 Remember: Sound like a person who has read the documents, not a system citing its sources."""
 
+            conversation = self._format_history(history)
             user_prompt = (
+                (f"CONVERSATION SO FAR:\n{conversation}\n\n" if conversation else "") +
                 f"Answer my question using the document excerpts below.\n\n"
                 f"DOCUMENT EXCERPTS:\n{'=' * 60}\n" + "\n".join(context_parts) +
                 f"\n\nMY QUESTION: {query}\n\nYour answer:"
@@ -637,8 +670,6 @@ Remember: Sound like a person who has read the documents, not a system citing it
             print(f"Error generating answer: {e}")
             return {"success": False, "message": f"Error generating answer: {str(e)}", "answer": None}
 
-
-# ── Singleton ────────────────────────────────────────────────────────────────
 
 _rag_service_instance = None
 

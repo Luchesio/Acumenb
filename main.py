@@ -1,15 +1,17 @@
-import fitz  # PyMuPDF
+import fitz
 import json
 import re
 import os
+import unicodedata
 import requests
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List
 import tempfile
 import secrets
 import hashlib
@@ -22,17 +24,15 @@ from pydantic import BaseModel, field_validator
 from bson import ObjectId
 import cloudinary
 import cloudinary.uploader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# ─── Google Auth ──────────────────────────────────────────────────────────────
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 
-# Load environment variables
 load_dotenv()
 
 app = FastAPI()
 
-# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -56,14 +56,31 @@ if not JWT_SECRET_KEY:
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 30
 
-# ─── Google OAuth configuration ───────────────────────────────────────────────
-# Add to your .env file:
-#   GOOGLE_CLIENT_ID=your_google_client_id.apps.googleusercontent.com
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 if not GOOGLE_CLIENT_ID:
     print("WARNING: GOOGLE_CLIENT_ID not set. Google Sign-In will be disabled.")
 
-# ─── Cloudinary configuration ─────────────────────────────────────────────────
+# ─── Upload limits ────────────────────────────────────────────────────────────
+MB = 1024 * 1024
+MAX_FILES_PER_UPLOAD = int(os.getenv("MAX_FILES_PER_UPLOAD", "10"))
+MAX_FILE_SIZE_MB = float(os.getenv("MAX_FILE_SIZE_MB", "25"))
+MAX_BATCH_SIZE_MB = float(os.getenv("MAX_BATCH_SIZE_MB", "60"))
+MAX_USER_STORAGE_MB = float(os.getenv("MAX_USER_STORAGE_MB", "200"))
+
+# ─── Chunking configuration ───────────────────────────────────────────────────
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+ENABLE_OCR = os.getenv("ENABLE_OCR", "true").lower() == "true"
+MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "6"))
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=CHUNK_SIZE,
+    chunk_overlap=CHUNK_OVERLAP,
+    length_function=len,
+    keep_separator=True,
+    separators=["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""],
+)
+
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
     api_key=os.getenv("CLOUDINARY_API_KEY"),
@@ -71,7 +88,6 @@ cloudinary.config(
     secure=True,
 )
 
-# ─── MongoDB client ───────────────────────────────────────────────────────────
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 context.minimum_version = ssl.TLSVersion.TLSv1_2
 
@@ -80,13 +96,9 @@ db = client[DATABASE_NAME]
 users_collection = db[USERS_COLLECTION]
 documents_collection = db[DOCUMENTS_COLLECTION]
 
-# ─── RAG Service ──────────────────────────────────────────────────────────────
 rag_service = get_rag_service()
-
-# ─── Voice Service ────────────────────────────────────────────────────────────
 voice_service = get_voice_service()
 
-# MongoDB indexes
 users_collection.create_index("email", unique=True)
 users_collection.create_index("user_id", unique=True)
 documents_collection.create_index("user_id")
@@ -137,8 +149,26 @@ class LoginRequest(BaseModel):
 
 
 class GoogleAuthRequest(BaseModel):
-    """Receives the credential (ID token) issued by Google Identity Services."""
     credential: str
+
+
+class ChatTurn(BaseModel):
+    role: str
+    content: str
+
+    @field_validator("role")
+    @classmethod
+    def normalise_role(cls, v: str) -> str:
+        return "user" if (v or "").strip().lower() == "user" else "assistant"
+
+    @field_validator("content")
+    @classmethod
+    def trim_content(cls, v: str) -> str:
+        return (v or "").strip()[:4000]
+
+
+class AskRequest(BaseModel):
+    history: List[ChatTurn] = []
 
 
 # ─── Password helpers ─────────────────────────────────────────────────────────
@@ -148,7 +178,6 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain_password: str, stored_hash: str, user_email: str) -> bool:
-    # Legacy SHA-256 migration shim
     if len(stored_hash) == 64 and re.fullmatch(r"[0-9a-f]{64}", stored_hash):
         if hashlib.sha256(plain_password.encode()).hexdigest() != stored_hash:
             return False
@@ -197,12 +226,13 @@ async def get_current_user(
 
 # ─── Cloudinary helpers ───────────────────────────────────────────────────────
 
-def upload_text_to_cloudinary(sections_data: list, user_id: str, upload_id: str) -> dict:
+def upload_chunks_to_cloudinary(chunks: list, user_id: str, upload_id: str, filename: str) -> dict:
     payload = json.dumps({
         "upload_id": upload_id,
         "user_id": user_id,
+        "filename": filename,
         "created_at": datetime.utcnow().isoformat(),
-        "sections": sections_data,
+        "chunks": chunks,
     }, ensure_ascii=False).encode("utf-8")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
@@ -214,7 +244,7 @@ def upload_text_to_cloudinary(sections_data: list, user_id: str, upload_id: str)
             tmp_path,
             resource_type="raw",
             folder=f"acumen/{user_id}/text",
-            public_id=f"{upload_id}_sections",
+            public_id=f"{upload_id}_chunks",
             overwrite=True,
         )
     finally:
@@ -235,169 +265,208 @@ def delete_cloudinary_resources(public_ids: list) -> None:
             print(f"Cloudinary delete failed for {pid}: {e}")
 
 
-def fetch_sections_from_cloudinary(text_url: str) -> list:
+def fetch_chunks_from_cloudinary(text_url: str) -> list:
     try:
         resp = requests.get(text_url, timeout=15)
         resp.raise_for_status()
-        return resp.json().get("sections", [])
+        data = resp.json()
+        return data.get("chunks") or data.get("sections", [])
     except Exception as e:
-        print(f"Failed to fetch sections from Cloudinary ({text_url}): {e}")
+        print(f"Failed to fetch chunks from Cloudinary ({text_url}): {e}")
         return []
 
 
 # ─── PDF text extraction ──────────────────────────────────────────────────────
 
-def clean_text(text: str) -> str:
+LIGATURES = {
+    "\ufb00": "ff", "\ufb01": "fi", "\ufb02": "fl", "\ufb03": "ffi", "\ufb04": "ffl",
+    "\ufb05": "st", "\ufb06": "st", "\u2018": "'", "\u2019": "'",
+    "\u201c": '"', "\u201d": '"', "\u2013": "-", "\u2014": "-", "\u00a0": " ",
+}
+
+
+def normalize_text(text: str) -> str:
     if not text:
         return ""
-    text = text.replace('\x00', '')
-    text = text.encode('utf-8', errors='ignore').decode('utf-8')
-    text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
-    text = re.sub(r' +', ' ', text)
-    text = re.sub(r'\t+', ' ', text)
-    text = re.sub(r'^\s*\d+\s*$', '', text, flags=re.MULTILINE)
-    text = re.sub(r'^\s*Page \d+\s*$', '', text, flags=re.MULTILINE | re.IGNORECASE)
+    text = text.replace("\x00", "")
+    text = unicodedata.normalize("NFKC", text)
+    for src, dst in LIGATURES.items():
+        text = text.replace(src, dst)
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-def extract_text_from_page(page) -> str:
-    text = page.get_text("text")
-    if not text or len(text.strip()) < 50:
+def extract_page_text(page) -> str:
+    text = ""
+    try:
+        text = page.get_text("text", sort=True) or ""
+    except Exception:
+        text = page.get_text("text") or ""
+
+    if len(text.strip()) < 20:
         try:
-            blocks = page.get_text("blocks")
-            text = "\n".join(b[4] for b in blocks if len(b) >= 5 and b[4].strip())
+            blocks = page.get_text("blocks", sort=True)
+            text = "\n".join(b[4] for b in blocks if len(b) >= 5 and isinstance(b[4], str))
         except Exception:
             pass
-    if not text or len(text.strip()) < 50:
+
+    if len(text.strip()) < 20:
         try:
-            d = page.get_text("dict")
-            parts = []
-            for block in d.get("blocks", []):
-                if block.get("type") == 0:
-                    for line in block.get("lines", []):
-                        t = "".join(s.get("text", "") for s in line.get("spans", []))
-                        if t.strip():
-                            parts.append(t)
-            text = "\n".join(parts)
+            data = page.get_text("dict")
+            lines = []
+            for block in data.get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    joined = "".join(s.get("text", "") for s in line.get("spans", []))
+                    if joined.strip():
+                        lines.append(joined)
+            text = "\n".join(lines)
         except Exception:
             pass
-    return clean_text(text)
+
+    if len(text.strip()) < 20 and ENABLE_OCR:
+        try:
+            tp = page.get_textpage_ocr(dpi=200, full=True)
+            text = page.get_text("text", textpage=tp) or text
+        except Exception:
+            pass
+
+    return normalize_text(text)
 
 
-def extract_sections_advanced(doc) -> list:
+def extract_pages(pdf_path: str) -> tuple:
+    pages = []
+    doc = fitz.open(pdf_path)
+    try:
+        metadata = doc.metadata or {}
+        total_pages = len(doc)
+        for i, page in enumerate(doc):
+            pages.append({"page_number": i + 1, "text": extract_page_text(page)})
+    finally:
+        doc.close()
+    return pages, metadata, total_pages
+
+
+def build_chunk_title(text: str, start_page: int, end_page: int) -> str:
+    page_ref = f"Page {start_page}" if start_page == end_page else f"Pages {start_page}-{end_page}"
+    first_line = next(
+        (l.strip() for l in text.split("\n")[:3] if 8 <= len(l.strip()) <= 90),
+        ""
+    )
+    return f"{page_ref} — {first_line}" if first_line else page_ref
+
+
+def chunk_pages(pages: list) -> list:
     full_text = ""
-    page_texts = []
-    for page_num, page in enumerate(doc):
-        t = extract_text_from_page(page)
-        if t:
-            page_texts.append({"page_number": page_num + 1, "text": t, "char_count": len(t)})
-            full_text += t + "\n\n"
+    spans = []
+    for page in pages:
+        if not page["text"]:
+            continue
+        start = len(full_text)
+        full_text += page["text"] + "\n\n"
+        spans.append((start, len(full_text), page["page_number"]))
 
     if not full_text.strip():
-        raise Exception("No text could be extracted. The PDF may be image-based or encrypted.")
+        return []
 
-    patterns = [
-        r'^(?:Chapter|CHAPTER|Ch\.|CH\.)\s+(\d+|[IVXLCDM]+)[\:\.\s]+(.+?)$',
-        r'^(?:Section|SECTION|Sec\.|SEC\.)\s+(\d+|[IVXLCDM]+)[\:\.\s]+(.+?)$',
-        r'^(\d+)\.\s+([A-Z][^\n]{10,100})$',
-        r'^([A-Z][A-Z\s]{3,80})$',
-        r'^(\d+\.\d+)\s+(.+?)$',
-        r'^(?:Part|PART|Book|BOOK)\s+(\d+|[IVXLCDM]+)[\:\.\s]+(.+?)$',
-    ]
-    detected = []
-    for p in patterns:
-        m = list(re.finditer(p, full_text, re.MULTILINE))
-        if len(m) >= 2:
-            detected = m
-            break
+    raw_chunks = text_splitter.split_text(full_text)
+    chunks = []
+    cursor = 0
 
-    cpp = len(full_text) / len(doc) if len(doc) > 0 else 1000
-    sections = []
+    for index, raw in enumerate(raw_chunks):
+        cleaned = raw.strip()
+        if not cleaned:
+            continue
 
-    if detected:
-        for i, match in enumerate(detected):
-            title = match.group(0).strip()
-            start_pos = match.start()
-            end_pos = detected[i + 1].start() if i + 1 < len(detected) else len(full_text)
-            text = full_text[start_pos:end_pos].strip()
-            sp = max(1, int(len(full_text[:start_pos]) / cpp) + 1)
-            ep = min(len(doc), sp + max(1, int(len(text) / cpp)))
-            sections.append({
-                "section_title": title, "start_page": sp, "end_page": ep,
-                "text_content": text, "section_type": "detected", "char_count": len(text),
-            })
-    elif len(doc) <= 5:
-        sections.append({
-            "section_title": "Complete Document", "start_page": 1, "end_page": len(doc),
-            "text_content": full_text, "section_type": "full_document", "char_count": len(full_text),
-        })
-    else:
-        for i in range(0, len(page_texts), 6):
-            chunk = page_texts[i:i + 6]
-            sp, ep = chunk[0]["page_number"], chunk[-1]["page_number"]
-            text = "\n\n".join(p["text"] for p in chunk)
-            title = next(
-                (l.strip() for l in text.split("\n")[:10] if 10 <= len(l.strip()) <= 100 and not l.strip().endswith(".")),
-                f"Pages {sp}-{ep}"
-            )
-            sections.append({
-                "section_title": title, "start_page": sp, "end_page": ep,
-                "text_content": text, "section_type": "page_chunk", "char_count": len(text),
-            })
+        probe = raw[:60]
+        position = full_text.find(probe, cursor)
+        if position == -1:
+            position = full_text.find(probe)
+        if position == -1:
+            position = cursor
+        end = position + len(raw)
+        cursor = position + max(1, len(raw) - CHUNK_OVERLAP)
 
-    return sections
+        matched = [pg for s, e, pg in spans if position < e and end > s]
+        start_page = min(matched) if matched else 1
+        end_page = max(matched) if matched else 1
 
-
-def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str) -> dict:
-    doc = fitz.open(pdf_path)
-    print(f"\nProcessing: {filename} ({len(doc)} pages)")
-    sections_data = extract_sections_advanced(doc)
-    metadata = doc.metadata
-    total_pages = len(doc)
-    doc.close()
-
-    if not sections_data:
-        raise Exception("No content extracted from PDF")
-
-    print("Uploading extracted text to Cloudinary...")
-    text_cl = upload_text_to_cloudinary(sections_data, user_id, upload_id)
-    print(f"Text uploaded ({text_cl['bytes']:,} bytes): {text_cl['url']}")
-
-    records = []
-    for idx, section in enumerate(sections_data):
-        records.append({
-            "user_id": user_id,
-            "upload_id": upload_id,
-            "filename": filename,
-            "section_number": idx + 1,
-            "section_title": section["section_title"],
-            "section_type": section["section_type"],
-            "char_count": section["char_count"],
-            "start_page": section["start_page"],
-            "end_page": section["end_page"],
-            "total_pages": total_pages,
-            "pdf_metadata": {
-                "author": metadata.get("author", ""),
-                "title": metadata.get("title", ""),
-                "subject": metadata.get("subject", ""),
-            },
-            "text_cloudinary_url": text_cl["url"],
-            "text_cloudinary_public_id": text_cl["public_id"],
-            "uploaded_at": datetime.utcnow(),
+        chunks.append({
+            "chunk_index": len(chunks) + 1,
+            "text": cleaned,
+            "chunk_title": build_chunk_title(cleaned, start_page, end_page),
+            "start_page": start_page,
+            "end_page": end_page,
+            "char_count": len(cleaned),
         })
 
-    result = documents_collection.insert_many(records)
-    print(f"Saved {len(result.inserted_ids)} metadata records to MongoDB")
+    return chunks
+
+
+def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str, file_size: int) -> dict:
+    pages, metadata, total_pages = extract_pages(pdf_path)
+    chunks = chunk_pages(pages)
+
+    if not chunks:
+        raise Exception(
+            "No readable text found. The PDF appears to be a scan or image-only file. "
+            "Enable OCR on the server or upload a text-based PDF."
+        )
+
+    text_cl = upload_chunks_to_cloudinary(chunks, user_id, upload_id, filename)
+
+    record = {
+        "user_id": user_id,
+        "upload_id": upload_id,
+        "filename": filename,
+        "file_size_bytes": file_size,
+        "total_pages": total_pages,
+        "total_chunks": len(chunks),
+        "total_characters": sum(c["char_count"] for c in chunks),
+        "pages_without_text": sum(1 for p in pages if not p["text"]),
+        "pdf_metadata": {
+            "author": metadata.get("author", ""),
+            "title": metadata.get("title", ""),
+            "subject": metadata.get("subject", ""),
+        },
+        "text_cloudinary_url": text_cl["url"],
+        "text_cloudinary_public_id": text_cl["public_id"],
+        "uploaded_at": datetime.utcnow(),
+    }
+
+    inserted = documents_collection.insert_one(record)
 
     return {
         "success": True,
         "upload_id": upload_id,
-        "sections_inserted": len(result.inserted_ids),
+        "filename": filename,
+        "document_ref": str(inserted.inserted_id),
+        "total_chunks": len(chunks),
+        "sections_inserted": len(chunks),
         "total_pages": total_pages,
-        "total_characters": sum(s["char_count"] for s in sections_data),
+        "total_characters": record["total_characters"],
+        "pages_without_text": record["pages_without_text"],
         "text_cloudinary_url": text_cl["url"],
-        "message": "PDF processed successfully",
+        "message": "PDF chunked and stored successfully",
     }
+
+
+# ─── Storage quota helpers ────────────────────────────────────────────────────
+
+def get_user_storage_bytes(user_id: str) -> int:
+    result = list(documents_collection.aggregate([
+        {"$match": {"user_id": user_id}},
+        {"$group": {"_id": "$upload_id", "size": {"$first": "$file_size_bytes"}}},
+        {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$size", 0]}}}},
+    ]))
+    return int(result[0]["total"]) if result else 0
+
+
+def limit_error(code: str, message: str, **extra) -> HTTPException:
+    return HTTPException(status_code=413, detail={"code": code, "message": message, **extra})
 
 
 # ─── Auth endpoints ───────────────────────────────────────────────────────────
@@ -406,8 +475,9 @@ def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str) -> d
 async def root():
     return {
         "message": "ACUMEN PDF API",
-        "version": "5.1",
-        "storage": "MongoDB (metadata) + Cloudinary (text) + Pinecone (vectors)",
+        "version": "6.0",
+        "storage": "MongoDB (metadata) + Cloudinary (chunks) + Pinecone (vectors)",
+        "chunking": f"RecursiveCharacterTextSplitter({CHUNK_SIZE}/{CHUNK_OVERLAP})",
     }
 
 
@@ -440,7 +510,6 @@ async def login_user(request: LoginRequest):
         if not user:
             raise HTTPException(status_code=401, detail="Invalid email or password.")
 
-        # Block password login for Google-only accounts
         if user.get("auth_provider") == "google" and not user.get("password_hash"):
             raise HTTPException(
                 status_code=400,
@@ -462,19 +531,10 @@ async def login_user(request: LoginRequest):
 
 @app.post("/auth/google")
 async def google_auth(request: GoogleAuthRequest):
-    """
-    Verify a Google ID token issued by Google Identity Services (GIS).
-    Creates a new user if one does not exist, otherwise logs in the existing user.
-    Returns the same JWT structure as /login and /register.
-    """
     if not GOOGLE_CLIENT_ID:
-        raise HTTPException(
-            status_code=503,
-            detail="Google Sign-In is not configured on this server."
-        )
+        raise HTTPException(status_code=503, detail="Google Sign-In is not configured on this server.")
 
     try:
-        # Verify the credential with Google's public keys
         idinfo = google_id_token.verify_oauth2_token(
             request.credential,
             google_requests.Request(),
@@ -484,7 +544,7 @@ async def google_auth(request: GoogleAuthRequest):
         raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
 
     email = idinfo.get("email", "").strip().lower()
-    google_sub = idinfo.get("sub")  # Unique Google user ID
+    google_sub = idinfo.get("sub")
     google_name = idinfo.get("name") or email.split("@")[0]
     email_verified = idinfo.get("email_verified", False)
 
@@ -498,7 +558,6 @@ async def google_auth(request: GoogleAuthRequest):
         existing_user = users_collection.find_one({"email": email})
 
         if existing_user:
-            # User already exists — update last_login and link google_id if not set
             update_fields: dict = {"last_login": datetime.utcnow()}
             if not existing_user.get("google_id"):
                 update_fields["google_id"] = google_sub
@@ -508,7 +567,6 @@ async def google_auth(request: GoogleAuthRequest):
             display_name = existing_user["name"]
             message = "Signed in with Google successfully."
         else:
-            # New user — create account (no password)
             user_id = secrets.token_urlsafe(16)
             display_name = google_name
             users_collection.insert_one({
@@ -539,54 +597,158 @@ async def google_auth(request: GoogleAuthRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─── Protected endpoints ──────────────────────────────────────────────────────
+# ─── Upload endpoints ─────────────────────────────────────────────────────────
+
+@app.get("/upload-limits")
+async def get_upload_limits(current_user: dict = Depends(get_current_user)):
+    used = get_user_storage_bytes(current_user["user_id"])
+    return {
+        "success": True,
+        "max_files_per_upload": MAX_FILES_PER_UPLOAD,
+        "max_file_size_mb": MAX_FILE_SIZE_MB,
+        "max_batch_size_mb": MAX_BATCH_SIZE_MB,
+        "max_storage_mb": MAX_USER_STORAGE_MB,
+        "storage_used_bytes": used,
+        "storage_used_mb": round(used / MB, 2),
+        "storage_remaining_mb": round(max(0.0, MAX_USER_STORAGE_MB - used / MB), 2),
+    }
+
+
+@app.post("/upload-pdfs")
+async def upload_pdfs(
+    files: List[UploadFile] = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="No files received.")
+
+    if len(files) > MAX_FILES_PER_UPLOAD:
+        raise limit_error(
+            "TOO_MANY_FILES",
+            f"You can upload up to {MAX_FILES_PER_UPLOAD} PDFs at a time. You selected {len(files)}.",
+            limit=MAX_FILES_PER_UPLOAD,
+            attempted=len(files),
+        )
+
+    invalid = [f.filename for f in files if not (f.filename or "").lower().endswith(".pdf")]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_TYPE", "message": "Only PDF files are allowed.", "files": invalid},
+        )
+
+    payloads = []
+    oversized = []
+    total_bytes = 0
+
+    for f in files:
+        data = await f.read()
+        size = len(data)
+        total_bytes += size
+        if size > MAX_FILE_SIZE_MB * MB:
+            oversized.append({"filename": f.filename, "size_mb": round(size / MB, 2)})
+        else:
+            payloads.append({"filename": f.filename, "data": data, "size": size})
+
+    if oversized:
+        raise limit_error(
+            "FILE_TOO_LARGE",
+            f"Each PDF must be {MAX_FILE_SIZE_MB:g} MB or smaller.",
+            limit_mb=MAX_FILE_SIZE_MB,
+            files=oversized,
+        )
+
+    if total_bytes > MAX_BATCH_SIZE_MB * MB:
+        raise limit_error(
+            "BATCH_TOO_LARGE",
+            f"This batch is {round(total_bytes / MB, 2)} MB. The limit is {MAX_BATCH_SIZE_MB:g} MB per upload.",
+            limit_mb=MAX_BATCH_SIZE_MB,
+            attempted_mb=round(total_bytes / MB, 2),
+        )
+
+    used_bytes = get_user_storage_bytes(current_user["user_id"])
+    if used_bytes + total_bytes > MAX_USER_STORAGE_MB * MB:
+        raise limit_error(
+            "STORAGE_LIMIT_REACHED",
+            f"This upload would exceed your {MAX_USER_STORAGE_MB:g} MB storage limit. "
+            f"Delete some documents to free up space.",
+            limit_mb=MAX_USER_STORAGE_MB,
+            used_mb=round(used_bytes / MB, 2),
+            remaining_mb=round(max(0.0, MAX_USER_STORAGE_MB - used_bytes / MB), 2),
+            attempted_mb=round(total_bytes / MB, 2),
+        )
+
+    results = []
+    for item in payloads:
+        upload_id = secrets.token_urlsafe(16)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(item["data"])
+                tmp_path = tmp.name
+
+            result = await run_in_threadpool(
+                process_pdf,
+                tmp_path,
+                current_user["user_id"],
+                item["filename"],
+                upload_id,
+                item["size"],
+            )
+
+            index_result = await run_in_threadpool(
+                rag_service.index_document,
+                current_user["user_id"],
+                upload_id,
+                result["text_cloudinary_url"],
+            )
+            result["rag_indexed"] = index_result.get("success", False)
+            result["rag_indexing"] = index_result
+            if not result["rag_indexed"]:
+                result["rag_indexing_warning"] = (
+                    "Document saved but AI indexing failed. Use Re-index to retry."
+                )
+            results.append(result)
+
+        except Exception as e:
+            documents_collection.delete_many(
+                {"user_id": current_user["user_id"], "upload_id": upload_id}
+            )
+            results.append({
+                "success": False,
+                "filename": item["filename"],
+                "upload_id": upload_id,
+                "message": str(e),
+            })
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    successful = [r for r in results if r.get("success")]
+    used_after = get_user_storage_bytes(current_user["user_id"])
+
+    return {
+        "success": len(successful) > 0,
+        "total_files": len(payloads),
+        "successful": len(successful),
+        "failed": len(results) - len(successful),
+        "total_chunks": sum(r.get("total_chunks", 0) for r in successful),
+        "storage_used_mb": round(used_after / MB, 2),
+        "storage_remaining_mb": round(max(0.0, MAX_USER_STORAGE_MB - used_after / MB), 2),
+        "results": results,
+        "message": f"{len(successful)} of {len(payloads)} PDFs processed",
+    }
+
 
 @app.post("/upload-pdf")
 async def upload_pdf(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
 ):
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+    return await upload_pdfs(files=[file], current_user=current_user)
 
-    upload_id = secrets.token_urlsafe(16)
-    tmp_file_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
-            tmp.write(await file.read())
-            tmp_file_path = tmp.name
 
-        result = process_pdf(
-            pdf_path=tmp_file_path,
-            user_id=current_user["user_id"],
-            filename=file.filename,
-            upload_id=upload_id,
-        )
-        os.unlink(tmp_file_path)
-        tmp_file_path = None
-
-        if result["success"]:
-            index_result = rag_service.index_document(
-                user_id=current_user["user_id"],
-                upload_id=upload_id,
-                text_cloudinary_url=result["text_cloudinary_url"],
-            )
-            result["rag_indexing"] = index_result
-            result["rag_indexed"] = index_result.get("success", False)
-            if not result["rag_indexed"]:
-                result["rag_indexing_warning"] = (
-                    "Document saved but AI indexing failed. "
-                    "ACUMEN won't recognise this document yet. "
-                    "Use the Re-index button to retry."
-                )
-
-        return result
-
-    except Exception as e:
-        if tmp_file_path and os.path.exists(tmp_file_path):
-            os.unlink(tmp_file_path)
-        raise HTTPException(status_code=500, detail=str(e))
-
+# ─── Document endpoints ───────────────────────────────────────────────────────
 
 @app.get("/my-documents")
 async def get_my_documents(current_user: dict = Depends(get_current_user)):
@@ -597,18 +759,29 @@ async def get_my_documents(current_user: dict = Depends(get_current_user)):
                 "_id": "$upload_id",
                 "filename": {"$first": "$filename"},
                 "uploaded_at": {"$first": "$uploaded_at"},
-                "total_sections": {"$sum": 1},
+                "record_count": {"$sum": 1},
+                "total_chunks": {"$first": "$total_chunks"},
                 "total_pages": {"$first": "$total_pages"},
-                "total_characters": {"$sum": "$char_count"},
+                "total_characters": {"$sum": {"$ifNull": ["$total_characters", "$char_count"]}},
+                "file_size_bytes": {"$first": "$file_size_bytes"},
                 "pdf_title": {"$first": "$pdf_metadata.title"},
                 "text_cloudinary_url": {"$first": "$text_cloudinary_url"},
             }},
             {"$sort": {"uploaded_at": -1}},
         ]
+        docs = list(documents_collection.aggregate(pipeline))
+        for d in docs:
+            d["total_sections"] = d.get("total_chunks") or d.get("record_count", 0)
+            d["size_mb"] = round((d.get("file_size_bytes") or 0) / MB, 2)
+
+        used = get_user_storage_bytes(current_user["user_id"])
         return {
             "success": True,
             "user_id": current_user["user_id"],
-            "total_uploads": len(docs := list(documents_collection.aggregate(pipeline))),
+            "total_uploads": len(docs),
+            "storage_used_mb": round(used / MB, 2),
+            "storage_remaining_mb": round(max(0.0, MAX_USER_STORAGE_MB - used / MB), 2),
+            "max_storage_mb": MAX_USER_STORAGE_MB,
             "documents": docs,
         }
     except Exception as e:
@@ -618,19 +791,24 @@ async def get_my_documents(current_user: dict = Depends(get_current_user)):
 @app.get("/document/{upload_id}")
 async def get_document_details(upload_id: str, current_user: dict = Depends(get_current_user)):
     try:
-        sections = list(documents_collection.find(
+        doc = documents_collection.find_one(
             {"user_id": current_user["user_id"], "upload_id": upload_id}
-        ).sort("section_number", 1))
-        if not sections:
+        )
+        if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
+
+        doc["_id"] = str(doc["_id"])
+        chunks = fetch_chunks_from_cloudinary(doc.get("text_cloudinary_url", ""))
         return {
             "success": True,
             "upload_id": upload_id,
-            "filename": sections[0]["filename"],
-            "total_sections": len(sections),
-            "total_characters": sum(s.get("char_count", 0) for s in sections),
-            "text_cloudinary_url": sections[0].get("text_cloudinary_url"),
-            "sections": sections,
+            "filename": doc["filename"],
+            "total_chunks": doc.get("total_chunks", len(chunks)),
+            "total_pages": doc.get("total_pages"),
+            "total_characters": doc.get("total_characters", 0),
+            "text_cloudinary_url": doc.get("text_cloudinary_url"),
+            "document": doc,
+            "chunks": chunks,
         }
     except HTTPException:
         raise
@@ -648,21 +826,22 @@ async def delete_document(upload_id: str, current_user: dict = Depends(get_curre
         if not sample:
             raise HTTPException(status_code=404, detail="Document not found")
 
-        delete_cloudinary_resources([
-            pid for pid in [
-                sample.get("text_cloudinary_public_id"),
-            ] if pid
-        ])
+        delete_cloudinary_resources(
+            [pid for pid in [sample.get("text_cloudinary_public_id")] if pid]
+        )
 
         db_result = documents_collection.delete_many(
             {"user_id": current_user["user_id"], "upload_id": upload_id}
         )
         rag_result = rag_service.delete_document_vectors(current_user["user_id"], upload_id)
+        used = get_user_storage_bytes(current_user["user_id"])
 
         return {
             "success": True,
-            "deleted_sections": db_result.deleted_count,
+            "deleted_records": db_result.deleted_count,
             "rag_deletion": rag_result,
+            "storage_used_mb": round(used / MB, 2),
+            "storage_remaining_mb": round(max(0.0, MAX_USER_STORAGE_MB - used / MB), 2),
             "message": "Document deleted from all storage layers",
         }
     except HTTPException:
@@ -671,38 +850,21 @@ async def delete_document(upload_id: str, current_user: dict = Depends(get_curre
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ─── RAG endpoints ────────────────────────────────────────────────────────────
+
 @app.get("/rag-search")
 async def rag_search(
     query: str,
-    top_k: int = 5,
+    top_k: int = 12,
     upload_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
 ):
     try:
         if not query or len(query.strip()) < 3:
             raise HTTPException(status_code=400, detail="Query must be at least 3 characters")
-        results = rag_service.search(
+        return rag_service.search(
             user_id=current_user["user_id"], query=query, top_k=top_k, upload_id=upload_id
         )
-        if not results["success"]:
-            return results
-
-        enhanced = []
-        for r in results["results"]:
-            try:
-                doc = documents_collection.find_one(
-                    {"_id": ObjectId(r["original_doc_ref"])},
-                    {"pdf_metadata": 1, "start_page": 1, "end_page": 1}
-                )
-                if doc:
-                    r["pdf_metadata"] = doc.get("pdf_metadata", {})
-                    r["start_page"] = doc.get("start_page")
-                    r["end_page"] = doc.get("end_page")
-            except Exception:
-                pass
-            enhanced.append(r)
-        results["results"] = enhanced
-        return results
     except HTTPException:
         raise
     except Exception as e:
@@ -712,15 +874,21 @@ async def rag_search(
 @app.post("/ask")
 async def ask_question(
     query: str,
-    top_k: int = 5,
+    top_k: int = 12,
     upload_id: Optional[str] = None,
+    payload: Optional[AskRequest] = None,
     current_user: dict = Depends(get_current_user)
 ):
     try:
         if not query or len(query.strip()) < 1:
             raise HTTPException(status_code=400, detail="Please enter a message.")
-        result = rag_service.generate_answer(
-            user_id=current_user["user_id"], query=query, top_k=top_k, upload_id=upload_id
+
+        turns = payload.history if payload else []
+        history = [t.model_dump() for t in turns if t.content][-MAX_HISTORY_TURNS:]
+
+        result = await run_in_threadpool(
+            rag_service.generate_answer,
+            current_user["user_id"], query, top_k, upload_id, history
         )
         if not result["success"]:
             raise HTTPException(status_code=500, detail=result.get("message", "Failed to generate answer"))
@@ -748,10 +916,9 @@ async def reindex_document(upload_id: str, current_user: dict = Depends(get_curr
         )
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
-        return rag_service.index_document(
-            user_id=current_user["user_id"],
-            upload_id=upload_id,
-            text_cloudinary_url=doc["text_cloudinary_url"],
+        return await run_in_threadpool(
+            rag_service.index_document,
+            current_user["user_id"], upload_id, doc["text_cloudinary_url"]
         )
     except HTTPException:
         raise
@@ -771,10 +938,9 @@ async def reindex_all_documents(current_user: dict = Depends(get_current_user)):
 
         indexed, errors = 0, []
         for d in docs:
-            res = rag_service.index_document(
-                user_id=current_user["user_id"],
-                upload_id=d["_id"],
-                text_cloudinary_url=d.get("text_cloudinary_url"),
+            res = await run_in_threadpool(
+                rag_service.index_document,
+                current_user["user_id"], d["_id"], d.get("text_cloudinary_url")
             )
             if res["success"]:
                 indexed += 1

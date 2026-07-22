@@ -3,14 +3,12 @@ uvicorn
 pymongo
 python-dotenv
 PyMuPDF
-pandas
 python-multipart
-faiss-cpu
+langchain-text-splitters
 google-generativeai
 google-genai
 numpy
 pinecone
-pdfplumber
 bcrypt
 python-jose[cryptography]
 email-validator
