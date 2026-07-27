@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from typing import Optional, List
 import tempfile
+import time
 import secrets
 import hashlib
 import ssl
@@ -73,6 +74,10 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 ENABLE_OCR = os.getenv("ENABLE_OCR", "true").lower() == "true"
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "6"))
+MAX_BULK_OPEN = int(os.getenv("MAX_BULK_OPEN", "10"))
+
+PDF_URL_STRATEGY = os.getenv("PDF_URL_STRATEGY", "download").strip().lower()
+PDF_URL_TTL_MINUTES = int(os.getenv("PDF_URL_TTL_MINUTES", "10"))
 
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=CHUNK_SIZE,
@@ -275,14 +280,31 @@ def upload_pdf_to_cloudinary(pdf_path: str, user_id: str, upload_id: str) -> dic
 
 
 def signed_pdf_url(public_id: str) -> str:
-    url, _ = cloudinary.utils.cloudinary_url(
+    """Two ways to hand out a private file. Both read assets uploaded as
+    type=authenticated, so switching strategies needs no re-upload.
+
+    download — Cloudinary's download API with an expiring signature. Works on
+               every plan. Default.
+    signed   — a signed delivery URL. Renders inline, but some accounts refuse
+               signed delivery of raw assets with a 401.
+    """
+    if PDF_URL_STRATEGY == "signed":
+        url, _ = cloudinary.utils.cloudinary_url(
+            public_id,
+            resource_type="raw",
+            type="authenticated",
+            sign_url=True,
+            secure=True,
+        )
+        return url
+
+    return cloudinary.utils.private_download_url(
         public_id,
+        None,
         resource_type="raw",
         type="authenticated",
-        sign_url=True,
-        secure=True,
+        expires_at=int(time.time()) + PDF_URL_TTL_MINUTES * 60,
     )
-    return url
 
 
 def delete_cloudinary_resources(public_ids: list) -> None:
@@ -866,6 +888,53 @@ async def get_document_details(upload_id: str, current_user: dict = Depends(get_
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class ViewLinksRequest(BaseModel):
+    upload_ids: List[str]
+
+
+@app.post("/documents/view-links")
+async def documents_view_links(
+    request: ViewLinksRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    ids = list(dict.fromkeys(request.upload_ids))[:MAX_BULK_OPEN]
+    if not ids:
+        raise HTTPException(status_code=400, detail="No documents specified.")
+
+    docs = list(documents_collection.aggregate([
+        {"$match": {"user_id": current_user["user_id"], "upload_id": {"$in": ids}}},
+        {"$group": {
+            "_id": "$upload_id",
+            "filename": {"$first": "$filename"},
+            "pdf_cloudinary_public_id": {"$first": "$pdf_cloudinary_public_id"},
+        }},
+    ]))
+
+    links, unavailable = [], []
+    found = {d["_id"] for d in docs}
+
+    for doc in docs:
+        public_id = doc.get("pdf_cloudinary_public_id")
+        if not public_id:
+            unavailable.append({"upload_id": doc["_id"], "filename": doc.get("filename", ""),
+                                "reason": "Original file was not stored"})
+            continue
+        try:
+            links.append({"upload_id": doc["_id"], "filename": doc.get("filename", ""),
+                          "url": signed_pdf_url(public_id)})
+        except Exception as e:
+            unavailable.append({"upload_id": doc["_id"], "filename": doc.get("filename", ""),
+                                "reason": f"Could not sign link: {e}"})
+
+    for missing in [i for i in ids if i not in found]:
+        unavailable.append({"upload_id": missing, "filename": "", "reason": "Document not found"})
+
+    order = {uid: i for i, uid in enumerate(ids)}
+    links.sort(key=lambda l: order.get(l["upload_id"], 0))
+
+    return {"success": True, "links": links, "unavailable": unavailable}
+
+
 @app.get("/document/{upload_id}/view")
 async def view_document(upload_id: str, current_user: dict = Depends(get_current_user)):
     doc = documents_collection.find_one(
@@ -890,7 +959,13 @@ async def view_document(upload_id: str, current_user: dict = Depends(get_current
         )
 
     try:
-        return {"success": True, "filename": doc.get("filename", ""), "url": signed_pdf_url(public_id)}
+        return {
+            "success": True,
+            "filename": doc.get("filename", ""),
+            "url": signed_pdf_url(public_id),
+            "strategy": PDF_URL_STRATEGY,
+            "expires_in_seconds": None if PDF_URL_STRATEGY == "signed" else PDF_URL_TTL_MINUTES * 60,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not generate a view link: {str(e)}")
 
