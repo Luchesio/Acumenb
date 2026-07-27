@@ -202,7 +202,7 @@ class RAGService:
     def _generate_general_response(self, query: str, history: Optional[List[dict]] = None) -> dict:
         try:
             model = genai.GenerativeModel(
-                model_name='gemini-2.0-flash',
+                model_name='gemini-3.5-flash-lite',
                 system_instruction=(
                     "You are Acumen, an AI assistant on a document Q&A platform. "
                     "No uploaded documents match this query. Answer from your own knowledge "
@@ -317,7 +317,7 @@ class RAGService:
         fallback = {"needs_documents": True, "queries": [query], "reply": ""}
         try:
             model = genai.GenerativeModel(
-                model_name='gemini-2.0-flash',
+                model_name='gemini-3.5-flash-lite',
                 system_instruction=(
                     "You route incoming messages for Acumen, an assistant that answers "
                     "questions about a user's uploaded PDF documents.\n\n"
@@ -418,9 +418,22 @@ class RAGService:
                     if existing is None or match.score > existing.score:
                         best_by_id[match.id] = match
 
-            merged = sorted(best_by_id.values(), key=lambda m: m.score, reverse=True)[:top_k]
+            merged = sorted(best_by_id.values(), key=lambda m: m.score, reverse=True)
             if not merged:
                 return {"success": False, "message": "No indexed documents available"}
+
+            candidate_uploads = {
+                m.metadata.get("upload_id") for m in merged if m.metadata.get("upload_id")
+            }
+            live_uploads = self._active_upload_ids(user_id, candidate_uploads)
+            stale = candidate_uploads - live_uploads
+            if stale:
+                print(f"Ignoring {len(stale)} deleted document(s) still present in the index: {stale}")
+                merged = [m for m in merged if m.metadata.get("upload_id") in live_uploads]
+                if not merged:
+                    return {"success": False, "message": "No indexed documents available"}
+
+            merged = merged[:top_k]
 
             processed = []
             for match in merged:
@@ -449,30 +462,142 @@ class RAGService:
 
     # ── Deletion & stats ─────────────────────────────────────────────────────
 
+    @staticmethod
+    def _as_id_list(page) -> List[str]:
+        if isinstance(page, str):
+            return [page]
+        if isinstance(page, list):
+            return [v if isinstance(v, str) else getattr(v, "id", str(v)) for v in page]
+        vectors = getattr(page, "vectors", None)
+        if vectors:
+            return [getattr(v, "id", str(v)) for v in vectors]
+        return [str(page)]
+
+    def _scan_namespace_for_upload(self, index, namespace: str, upload_id: str) -> List[str]:
+        """Walk every vector in the namespace and match on metadata. Only used when
+        the ID-prefix lookup finds nothing, i.e. vectors written by an older build
+        whose IDs did not encode the upload_id."""
+        found: List[str] = []
+        try:
+            for page in index.list(namespace=namespace):
+                batch = self._as_id_list(page)
+                if not batch:
+                    continue
+                fetched = index.fetch(ids=batch, namespace=namespace)
+                vectors = getattr(fetched, "vectors", None)
+                if vectors is None and isinstance(fetched, dict):
+                    vectors = fetched.get("vectors", {})
+                for vid, vec in (vectors or {}).items():
+                    meta = getattr(vec, "metadata", None)
+                    if meta is None and isinstance(vec, dict):
+                        meta = vec.get("metadata")
+                    if (meta or {}).get("upload_id") == upload_id:
+                        found.append(vid)
+        except Exception as e:
+            print(f"Namespace scan failed for {upload_id}: {e}")
+        return found
+
     def delete_document_vectors(self, user_id: str, upload_id: str) -> dict:
+        """Deletes by ID because Pinecone serverless does not support delete-by-filter.
+        Reports how many vectors were removed and whether any survived, so callers can
+        refuse to drop the Mongo record while vectors are still searchable."""
         try:
             index = self._ensure_user_index(user_id)
             namespace = self._get_user_namespace(user_id)
-            ids = []
 
+            ids: List[str] = []
             try:
                 for page in index.list(prefix=f"{upload_id}#", namespace=namespace):
-                    ids.extend(page if isinstance(page, list) else [page])
-            except Exception:
-                results = index.query(
-                    vector=[0.0] * self.embedding_dimension,
-                    top_k=10000,
-                    filter={"upload_id": upload_id},
-                    namespace=namespace,
-                )
-                ids = [m.id for m in results.matches]
+                    ids.extend(self._as_id_list(page))
+            except Exception as e:
+                print(f"Prefix listing unavailable ({e}); falling back to scan")
+
+            if not ids:
+                ids = self._scan_namespace_for_upload(index, namespace, upload_id)
+
+            ids = list(dict.fromkeys(ids))
+            if not ids:
+                return {"success": True, "deleted_count": 0, "remaining": 0,
+                        "message": "No vectors found for this document"}
 
             for i in range(0, len(ids), 1000):
                 index.delete(ids=ids[i:i + 1000], namespace=namespace)
 
-            return {"success": True, "deleted_count": len(ids)}
+            remaining = 0
+            try:
+                check = index.fetch(ids=ids[:100], namespace=namespace)
+                vectors = getattr(check, "vectors", None)
+                if vectors is None and isinstance(check, dict):
+                    vectors = check.get("vectors", {})
+                remaining = len(vectors or {})
+            except Exception as e:
+                print(f"Post-delete verification skipped: {e}")
+
+            return {
+                "success": remaining == 0,
+                "deleted_count": len(ids),
+                "remaining": remaining,
+                "message": (
+                    f"Deleted {len(ids)} vectors"
+                    if remaining == 0
+                    else f"{remaining} vectors still present after delete (eventual consistency or partial failure)"
+                ),
+            }
         except Exception as e:
-            return {"success": False, "message": f"Delete error: {str(e)}"}
+            return {"success": False, "deleted_count": 0, "message": f"Delete error: {str(e)}"}
+
+    def _active_upload_ids(self, user_id: str, upload_ids: set) -> set:
+        if not upload_ids:
+            return set()
+        rows = self.documents_collection.find(
+            {"user_id": user_id, "upload_id": {"$in": list(upload_ids)}},
+            {"upload_id": 1, "_id": 0},
+        )
+        return {r["upload_id"] for r in rows}
+
+    def cleanup_orphan_vectors(self, user_id: str) -> dict:
+        """Removes vectors whose document no longer exists in Mongo."""
+        try:
+            index = self._ensure_user_index(user_id)
+            namespace = self._get_user_namespace(user_id)
+
+            live = {
+                d["_id"] for d in self.documents_collection.aggregate([
+                    {"$match": {"user_id": user_id}},
+                    {"$group": {"_id": "$upload_id"}},
+                ])
+            }
+
+            orphan_ids: List[str] = []
+            orphan_uploads: set = set()
+            for page in index.list(namespace=namespace):
+                batch = self._as_id_list(page)
+                if not batch:
+                    continue
+                fetched = index.fetch(ids=batch, namespace=namespace)
+                vectors = getattr(fetched, "vectors", None)
+                if vectors is None and isinstance(fetched, dict):
+                    vectors = fetched.get("vectors", {})
+                for vid, vec in (vectors or {}).items():
+                    meta = getattr(vec, "metadata", None)
+                    if meta is None and isinstance(vec, dict):
+                        meta = vec.get("metadata")
+                    uid = (meta or {}).get("upload_id")
+                    if uid and uid not in live:
+                        orphan_ids.append(vid)
+                        orphan_uploads.add(uid)
+
+            for i in range(0, len(orphan_ids), 1000):
+                index.delete(ids=orphan_ids[i:i + 1000], namespace=namespace)
+
+            return {
+                "success": True,
+                "deleted_vectors": len(orphan_ids),
+                "orphaned_documents": len(orphan_uploads),
+                "message": f"Removed {len(orphan_ids)} orphaned vectors from {len(orphan_uploads)} deleted documents",
+            }
+        except Exception as e:
+            return {"success": False, "message": f"Cleanup error: {str(e)}"}
 
     def delete_user_vectors(self, user_id: str) -> dict:
         try:
@@ -640,7 +765,7 @@ Remember: Sound like a person who has read the documents, not a system citing it
             )
 
             model = genai.GenerativeModel(
-                model_name='gemini-2.5-flash',
+                model_name='gemini-3.5-flash-lite',
                 system_instruction=system_prompt,
             )
             response = model.generate_content(

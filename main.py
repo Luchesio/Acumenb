@@ -24,6 +24,7 @@ from pydantic import BaseModel, field_validator
 from bson import ObjectId
 import cloudinary
 import cloudinary.uploader
+import cloudinary.utils
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from google.oauth2 import id_token as google_id_token
@@ -257,12 +258,42 @@ def upload_chunks_to_cloudinary(chunks: list, user_id: str, upload_id: str, file
     }
 
 
+def upload_pdf_to_cloudinary(pdf_path: str, user_id: str, upload_id: str) -> dict:
+    result = cloudinary.uploader.upload(
+        pdf_path,
+        resource_type="raw",
+        type="authenticated",
+        folder=f"acumen/{user_id}/pdf",
+        public_id=f"{upload_id}.pdf",
+        overwrite=True,
+    )
+    return {
+        "url": result["secure_url"],
+        "public_id": result["public_id"],
+        "bytes": result.get("bytes", 0),
+    }
+
+
+def signed_pdf_url(public_id: str) -> str:
+    url, _ = cloudinary.utils.cloudinary_url(
+        public_id,
+        resource_type="raw",
+        type="authenticated",
+        sign_url=True,
+        secure=True,
+    )
+    return url
+
+
 def delete_cloudinary_resources(public_ids: list) -> None:
     for pid in public_ids:
-        try:
-            cloudinary.uploader.destroy(pid, resource_type="raw")
-        except Exception as e:
-            print(f"Cloudinary delete failed for {pid}: {e}")
+        for delivery_type in ("upload", "authenticated"):
+            try:
+                res = cloudinary.uploader.destroy(pid, resource_type="raw", type=delivery_type)
+                if res.get("result") == "ok":
+                    break
+            except Exception as e:
+                print(f"Cloudinary delete failed for {pid} ({delivery_type}): {e}")
 
 
 def fetch_chunks_from_cloudinary(text_url: str) -> list:
@@ -418,6 +449,12 @@ def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str, file
 
     text_cl = upload_chunks_to_cloudinary(chunks, user_id, upload_id, filename)
 
+    pdf_cl = {"url": "", "public_id": "", "bytes": 0}
+    try:
+        pdf_cl = upload_pdf_to_cloudinary(pdf_path, user_id, upload_id)
+    except Exception as e:
+        print(f"Original PDF could not be stored for {upload_id}: {e}")
+
     record = {
         "user_id": user_id,
         "upload_id": upload_id,
@@ -434,6 +471,10 @@ def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str, file
         },
         "text_cloudinary_url": text_cl["url"],
         "text_cloudinary_public_id": text_cl["public_id"],
+        "text_bytes": text_cl.get("bytes", 0),
+        "pdf_cloudinary_public_id": pdf_cl["public_id"],
+        "pdf_bytes": pdf_cl.get("bytes", 0),
+        "has_pdf": bool(pdf_cl["public_id"]),
         "uploaded_at": datetime.utcnow(),
     }
 
@@ -450,6 +491,7 @@ def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str, file
         "total_characters": record["total_characters"],
         "pages_without_text": record["pages_without_text"],
         "text_cloudinary_url": text_cl["url"],
+        "has_pdf": bool(pdf_cl["public_id"]),
         "message": "PDF chunked and stored successfully",
     }
 
@@ -459,8 +501,15 @@ def process_pdf(pdf_path: str, user_id: str, filename: str, upload_id: str, file
 def get_user_storage_bytes(user_id: str) -> int:
     result = list(documents_collection.aggregate([
         {"$match": {"user_id": user_id}},
-        {"$group": {"_id": "$upload_id", "size": {"$first": "$file_size_bytes"}}},
-        {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$size", 0]}}}},
+        {"$group": {
+            "_id": "$upload_id",
+            "size": {"$first": "$file_size_bytes"},
+            "text": {"$first": "$text_bytes"},
+        }},
+        {"$group": {"_id": None, "total": {"$sum": {"$add": [
+            {"$ifNull": ["$size", 0]},
+            {"$ifNull": ["$text", 0]},
+        ]}}}},
     ]))
     return int(result[0]["total"]) if result else 0
 
@@ -766,6 +815,7 @@ async def get_my_documents(current_user: dict = Depends(get_current_user)):
                 "file_size_bytes": {"$first": "$file_size_bytes"},
                 "pdf_title": {"$first": "$pdf_metadata.title"},
                 "text_cloudinary_url": {"$first": "$text_cloudinary_url"},
+                "has_pdf": {"$first": "$has_pdf"},
             }},
             {"$sort": {"uploaded_at": -1}},
         ]
@@ -816,24 +866,74 @@ async def get_document_details(upload_id: str, current_user: dict = Depends(get_
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/document/{upload_id}/view")
+async def view_document(upload_id: str, current_user: dict = Depends(get_current_user)):
+    doc = documents_collection.find_one(
+        {"user_id": current_user["user_id"], "upload_id": upload_id},
+        {"pdf_cloudinary_public_id": 1, "filename": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    public_id = doc.get("pdf_cloudinary_public_id")
+    if not public_id:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "NO_ORIGINAL_PDF",
+                "message": (
+                    "The original file for this document was not kept. Documents uploaded "
+                    "before this feature only stored their extracted text. Re-upload it to "
+                    "enable viewing."
+                ),
+            },
+        )
+
+    try:
+        return {"success": True, "filename": doc.get("filename", ""), "url": signed_pdf_url(public_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not generate a view link: {str(e)}")
+
+
+@app.post("/cleanup-orphans")
+async def cleanup_orphans(current_user: dict = Depends(get_current_user)):
+    try:
+        return rag_service.cleanup_orphan_vectors(current_user["user_id"])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.delete("/document/{upload_id}")
 async def delete_document(upload_id: str, current_user: dict = Depends(get_current_user)):
     try:
         sample = documents_collection.find_one(
             {"user_id": current_user["user_id"], "upload_id": upload_id},
-            {"text_cloudinary_public_id": 1}
+            {"text_cloudinary_public_id": 1, "pdf_cloudinary_public_id": 1}
         )
         if not sample:
             raise HTTPException(status_code=404, detail="Document not found")
 
-        delete_cloudinary_resources(
-            [pid for pid in [sample.get("text_cloudinary_public_id")] if pid]
-        )
+        rag_result = rag_service.delete_document_vectors(current_user["user_id"], upload_id)
+        if not rag_result.get("success"):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Could not remove this document from the search index, so it was not "
+                    "deleted. Nothing was lost — please try again. "
+                    f"({rag_result.get('message', 'unknown error')})"
+                ),
+            )
+
+        delete_cloudinary_resources([
+            pid for pid in [
+                sample.get("text_cloudinary_public_id"),
+                sample.get("pdf_cloudinary_public_id"),
+            ] if pid
+        ])
 
         db_result = documents_collection.delete_many(
             {"user_id": current_user["user_id"], "upload_id": upload_id}
         )
-        rag_result = rag_service.delete_document_vectors(current_user["user_id"], upload_id)
         used = get_user_storage_bytes(current_user["user_id"])
 
         return {
