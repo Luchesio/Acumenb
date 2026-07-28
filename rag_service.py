@@ -657,6 +657,107 @@ class RAGService:
             return chunks[idx].get("text", "")
         return ""
 
+    def _attachment_parts(self, attachments: Optional[List[dict]]) -> list:
+        """Turns decoded attachments into Gemini Parts. Images and PDFs are sent
+        inline; the caller is responsible for size limits."""
+        from google.genai import types as gtypes
+        parts = []
+        for att in attachments or []:
+            data = att.get("data")
+            mime = att.get("mime_type", "")
+            if not data or not mime:
+                continue
+            parts.append(gtypes.Part.from_bytes(data=data, mime_type=mime))
+        return parts
+
+    def answer_with_attachments(
+        self,
+        query: str,
+        attachments: List[dict],
+        history: Optional[List[dict]] = None,
+        doc_context: str = "",
+    ) -> dict:
+        """Answers a question about files the user attached to the message.
+        Uses the newer google-genai client because the legacy SDK in this module
+        does not accept inline binary parts."""
+        from google import genai as gclient
+        from google.genai import types as gtypes
+
+        client = gclient.Client(api_key=self.gemini_api_key)
+        names = ", ".join(a.get("filename", "attachment") for a in attachments)
+
+        instruction = (
+            "You are Acumen. The user has attached one or more files to this message. "
+            "Answer their question about the attached files directly and in natural "
+            "flowing prose. Do not use bullet points or numbered lists unless asked. "
+            "If document excerpts from their library are also provided, use them only "
+            "where they genuinely add to the answer, and say which source you are "
+            "drawing on when you do."
+        )
+
+        conversation = self._format_history(history)
+        prompt_parts = [instruction]
+        if conversation:
+            prompt_parts.append(f"\nCONVERSATION SO FAR:\n{conversation}")
+        if doc_context:
+            prompt_parts.append(f"\nEXCERPTS FROM THE USER'S LIBRARY:\n{doc_context}")
+        prompt_parts.append(f"\nATTACHED: {names}")
+        prompt_parts.append(f"\nQUESTION: {query}" if query.strip()
+                            else "\nQUESTION: Describe and summarise the attached file(s).")
+
+        contents = ["\n".join(prompt_parts)] + self._attachment_parts(attachments)
+
+        try:
+            response = client.models.generate_content(
+                model=os.getenv("VISION_MODEL", "gemini-2.5-flash"),
+                contents=contents,
+                config=gtypes.GenerateContentConfig(
+                    temperature=0.2, max_output_tokens=4096,
+                ),
+            )
+            answer = (response.text or "").strip()
+            if not answer:
+                raise RuntimeError("Empty response")
+            answer = re.sub(r'^\s*[\*\-]\s+', '', answer, flags=re.MULTILINE)
+            answer = re.sub(r'\n\s*\n\s*\n+', '\n\n', answer).strip()
+            return {
+                "success": True,
+                "answer": answer,
+                "sources": [],
+                "query": query,
+                "context_documents_used": 0,
+                "response_type": "attachment",
+                "attachments_used": [a.get("filename", "") for a in attachments],
+            }
+        except Exception as e:
+            print(f"Attachment answer failed: {e}")
+            return {"success": False, "message": f"Could not read the attached file(s): {e}",
+                    "answer": None}
+
+    def build_context_for_query(
+        self, user_id: str, query: str, top_k: int = 6, upload_id: Optional[str] = None
+    ) -> str:
+        """Retrieval-only helper used when attachments drive the answer but the
+        user's own library may still be relevant."""
+        if not query.strip():
+            return ""
+        results = self.search(user_id=user_id, query=query, top_k=top_k, upload_id=upload_id)
+        if not results.get("success"):
+            return ""
+        cache: dict = {}
+        parts, used = [], 0
+        for r in results.get("results", []):
+            if r["similarity"] < self.SIMILARITY_THRESHOLD:
+                continue
+            text = self._resolve_chunk_text(r, cache)
+            if not text:
+                continue
+            if used + len(text) > 24000:
+                break
+            parts.append(f"Source: {r['filename']}\n{text}")
+            used += len(text)
+        return "\n\n".join(parts)
+
     def generate_answer(
         self,
         user_id: str,

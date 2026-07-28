@@ -4,7 +4,7 @@ import re
 import os
 import unicodedata
 import requests
-from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends
+from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends, Form
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -75,6 +75,15 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 ENABLE_OCR = os.getenv("ENABLE_OCR", "true").lower() == "true"
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "6"))
 MAX_BULK_OPEN = int(os.getenv("MAX_BULK_OPEN", "10"))
+
+# Vercel rejects request bodies over 4.5 MB before they reach this app, so the
+# ceiling here is deliberately below that to leave room for the rest of the form.
+MAX_ATTACHMENTS = int(os.getenv("MAX_ATTACHMENTS", "4"))
+MAX_ATTACHMENT_MB = float(os.getenv("MAX_ATTACHMENT_MB", "3.5"))
+ALLOWED_ATTACHMENT_TYPES = {
+    "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif",
+    "application/pdf",
+}
 
 PDF_URL_STRATEGY = os.getenv("PDF_URL_STRATEGY", "download").strip().lower()
 PDF_URL_TTL_MINUTES = int(os.getenv("PDF_URL_TTL_MINUTES", "10"))
@@ -1046,6 +1055,81 @@ async def rag_search(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/ask-with-files")
+async def ask_with_files(
+    query: str = "",
+    top_k: int = 12,
+    upload_id: Optional[str] = None,
+    history_json: str = Form("[]"),
+    files: List[UploadFile] = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="No files received.")
+
+    if len(files) > MAX_ATTACHMENTS:
+        raise limit_error(
+            "TOO_MANY_ATTACHMENTS",
+            f"You can attach up to {MAX_ATTACHMENTS} files to a message.",
+            limit=MAX_ATTACHMENTS, attempted=len(files),
+        )
+
+    attachments, oversized, wrong_type = [], [], []
+    total = 0
+
+    for f in files:
+        mime = (f.content_type or "").split(";")[0].strip().lower()
+        if mime not in ALLOWED_ATTACHMENT_TYPES:
+            wrong_type.append(f"{f.filename} — {mime or 'unknown type'}")
+            continue
+        data = await f.read()
+        total += len(data)
+        if len(data) > MAX_ATTACHMENT_MB * MB:
+            oversized.append({"filename": f.filename, "size_mb": round(len(data) / MB, 2)})
+            continue
+        attachments.append({"filename": f.filename, "mime_type": mime, "data": data})
+
+    if wrong_type:
+        raise HTTPException(status_code=400, detail={
+            "code": "INVALID_ATTACHMENT",
+            "message": "Only images (JPEG, PNG, WebP, HEIC) and PDFs can be attached.",
+            "files": wrong_type,
+        })
+
+    if oversized:
+        raise limit_error(
+            "ATTACHMENT_TOO_LARGE",
+            f"Each attachment must be {MAX_ATTACHMENT_MB:g} MB or smaller.",
+            limit_mb=MAX_ATTACHMENT_MB, files=oversized,
+        )
+
+    if not attachments:
+        raise HTTPException(status_code=400, detail="No usable attachments.")
+
+    try:
+        history = [
+            t.model_dump() for t in AskRequest(**{"history": json.loads(history_json)}).history
+            if t.content
+        ][-MAX_HISTORY_TURNS:]
+    except Exception:
+        history = []
+
+    doc_context = ""
+    if query.strip():
+        doc_context = await run_in_threadpool(
+            rag_service.build_context_for_query,
+            current_user["user_id"], query, 6, upload_id
+        )
+
+    result = await run_in_threadpool(
+        rag_service.answer_with_attachments,
+        query, attachments, history, doc_context
+    )
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=result.get("message", "Failed to read attachments"))
+    return result
+
+
 @app.post("/ask")
 async def ask_question(
     query: str,
@@ -1137,6 +1221,17 @@ async def reindex_all_documents(current_user: dict = Depends(get_current_user)):
 
 class SpeakRequest(BaseModel):
     text: str
+
+
+@app.post("/speak-chunks")
+async def speak_chunks(
+    request: SpeakRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Splits an answer into speakable segments. The client requests audio for
+    one segment at a time so no single response approaches the 4.5 MB ceiling."""
+    chunks = voice_service.split_for_speech(request.text)
+    return {"success": True, "chunks": chunks, "count": len(chunks)}
 
 
 @app.post("/transcribe")
